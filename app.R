@@ -11,6 +11,7 @@ library(purrr)
 library(stringr)
 library(DT)
 library(jsonlite)
+library(googlesheets4)
 
 # ---------- Helpers ------------------------------------------------------------
 
@@ -172,8 +173,8 @@ make_schedule <- function(players) {
 
 # ---------- Scoring / Spreadsheet (by ROUND) ----------------------------------
 
-compute_player_diffs <- function(players, schedule_games, scores_tbl) {
-  long_sched <- schedule_games %>%
+player_game_results <- function(schedule_games, scores_tbl) {
+  schedule_games %>%
     mutate(A_players = str_split(teamA, " / "),
            B_players = str_split(teamB, " / ")) %>%
     select(game_id, round, court, A_players, B_players) %>%
@@ -181,39 +182,113 @@ compute_player_diffs <- function(players, schedule_games, scores_tbl) {
                  names_to = "team_label", values_to = "players") %>%
     mutate(team_label = ifelse(team_label == "A_players", "A", "B")) %>%
     unnest(players) %>%
-    rename(player = players)
-  
-  diffs_long <- long_sched %>%
+    rename(player = players) %>%
     left_join(scores_tbl, by = "game_id") %>%
     mutate(
-      diff  = ifelse(is.na(scoreA) | is.na(scoreB), NA_real_, scoreA - scoreB),
+      diff = ifelse(is.na(scoreA) | is.na(scoreB), NA_real_, scoreA - scoreB),
       pdiff = case_when(
         is.na(diff) ~ NA_real_,
-        team_label == "A" ~  diff,
-        TRUE              ~ -diff
+        team_label == "A" ~ diff,
+        TRUE ~ -diff
+      ),
+      result = case_when(
+        is.na(diff) ~ NA_character_,
+        team_label == "A" & diff > 0 ~ "W",
+        team_label == "B" & diff < 0 ~ "W",
+        diff == 0 ~ "T",
+        TRUE ~ "L"
       )
-    ) %>%
-    select(player, round, pdiff)
-  
-  rdiffs <- diffs_long %>%
-    group_by(player, round) %>%
-    summarise(rdiff = if (all(is.na(pdiff))) NA_real_ else sum(pdiff, na.rm = TRUE),
-              .groups = "drop")
-  
-  base <- tibble(Player = players)
+    )
+}
+
+compute_player_results <- function(players, schedule_games, scores_tbl) {
+  game_results <- player_game_results(schedule_games, scores_tbl)
   round_cols_order <- paste0("Round ", sort(unique(schedule_games$round)))
-  
-  wide <- rdiffs %>%
+  base <- tibble(Player = players)
+
+  records <- game_results %>%
+    group_by(player) %>%
+    summarise(
+      Wins = sum(result == "W", na.rm = TRUE),
+      Losses = sum(result == "L", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      `Win %` = if_else(Wins + Losses > 0, Wins / (Wins + Losses), NA_real_)
+    )
+
+  rdiffs <- game_results %>%
+    group_by(player, round) %>%
+    summarise(
+      rdiff = if (all(is.na(pdiff))) NA_real_ else sum(pdiff, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  round_wide <- rdiffs %>%
     mutate(col = paste0("Round ", round)) %>%
     select(player, col, rdiff) %>%
-    pivot_wider(names_from = col, values_from = rdiff) %>%
-    right_join(base, by = c("player" = "Player")) %>%
-    rename(Player = player)
-  
-  for (rc in setdiff(round_cols_order, names(wide))) wide[[rc]] <- NA_real_
-  wide <- wide %>% select(Player, all_of(round_cols_order))
-  wide$Total <- rowSums(replace(wide[round_cols_order], is.na(wide[round_cols_order]), 0), na.rm = TRUE)
-  wide
+    pivot_wider(names_from = col, values_from = rdiff)
+
+  for (rc in setdiff(round_cols_order, names(round_wide))) round_wide[[rc]] <- NA_real_
+
+  round_wide <- round_wide %>%
+    select(player, all_of(round_cols_order))
+  round_wide$Total <- rowSums(
+    replace(round_wide[round_cols_order], is.na(round_wide[round_cols_order]), 0),
+    na.rm = TRUE
+  )
+
+  base %>%
+    left_join(records, by = c("Player" = "player")) %>%
+    left_join(round_wide, by = c("Player" = "player")) %>%
+    mutate(
+      Wins = replace_na(Wins, 0L),
+      Losses = replace_na(Losses, 0L)
+    ) %>%
+    select(Player, Wins, Losses, `Win %`, all_of(round_cols_order), Total)
+}
+
+extract_sheet_id <- function(url_or_id) {
+  if (is.null(url_or_id) || !nzchar(trimws(url_or_id))) {
+    env_id <- Sys.getenv("GOOGLE_SHEET_ID", "")
+    if (nzchar(env_id)) return(env_id)
+    stop("Enter a Google Sheet URL, or set GOOGLE_SHEET_ID in your environment.")
+  }
+
+  x <- trimws(url_or_id)
+  if (!grepl("^https?://", x)) return(x)
+
+  id <- stringr::str_match(x, "/d/([a-zA-Z0-9-_]+)")[, 2]
+  if (!is.na(id)) return(id)
+
+  id <- stringr::str_match(x, "[?&]id=([a-zA-Z0-9-_]+)")[, 2]
+  if (!is.na(id)) return(id)
+
+  stop("Could not parse a Google Sheet ID from that URL.")
+}
+
+gs_auth <- function() {
+  sa_path <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+  if (nzchar(sa_path) && file.exists(sa_path)) {
+    gs4_deauth()
+    gs4_auth(path = sa_path)
+    return(invisible(TRUE))
+  }
+
+  gs4_auth(email = TRUE)
+  invisible(TRUE)
+}
+
+push_results_to_sheet <- function(results_tbl, sheet_id, sheet_name = "DDC Results") {
+  gs_auth()
+  sheet_write(results_tbl, ss = sheet_id, sheet = sheet_name)
+  props <- sheet_properties(sheet_id)
+  gid <- props$sheet_id[props$name == sheet_name]
+  if (length(gid) == 1 && !is.na(gid)) {
+    paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit#gid=", gid)
+  } else {
+    paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
+  }
 }
 
 # ---------- UI ----------------------------------------------------------------
@@ -254,14 +329,26 @@ ui <- fluidPage(
       h4("2) Options"),
       checkboxInput("compact_names", "Compact team display (initials)", FALSE),
       hr(),
-      h4("Download"),
-      downloadButton("download_csv", "Download Player Differentials (CSV)")
+      h4("Google Sheet"),
+      textInput(
+        "sheet_url",
+        "Sheet URL or ID",
+        placeholder = "https://docs.google.com/spreadsheets/d/...",
+        width = "100%"
+      ),
+      actionButton("push_sheets", "Push Results to Google Sheet", class = "btn-success"),
+      helpText(
+        "Share the sheet with your Google account or service account before pushing.",
+        tags$br(),
+        "Optional env vars: GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON"
+      ),
+      verbatimTextOutput("sheet_push_status")
     ),
     mainPanel(
       h4("Schedule, Courts, Byes, & Scoring"),
       uiOutput("games_ui"),
       hr(),
-      h4("Per-Player Point Differentials"),
+      h4("Player Results"),
       DTOutput("player_table")
     )
   )
@@ -394,26 +481,48 @@ server <- function(input, output, session) {
     do.call(tagList, elems)
   })
   
-  # Spreadsheet: per-player round differentials
-  player_diffs <- reactive({
+  player_results <- reactive({
     req(schedule())
-    compute_player_diffs(players_vec(), schedule()$games, scores_tbl())
+    compute_player_results(players_vec(), schedule()$games, scores_tbl())
   })
-  
+
   output$player_table <- renderDT({
-    req(player_diffs())
+    req(player_results())
+    tbl <- player_results()
     datatable(
-      player_diffs(),
+      tbl,
       rownames = FALSE,
       extensions = "Buttons",
       options = list(dom = "Bfrtip", buttons = c("copy", "csv"), pageLength = 25)
-    )
+    ) %>%
+      formatPercentage("Win %", digits = 1)
   })
-  
-  output$download_csv <- downloadHandler(
-    filename = function() paste0("player_differentials_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
-    content  = function(file) readr::write_csv(player_diffs(), file)
-  )
+
+  output$sheet_push_status <- renderText({
+    sheet_push_status()
+  })
+
+  sheet_push_status <- reactiveVal("")
+
+  observeEvent(input$push_sheets, {
+    sheet_push_status("Pushing results to Google Sheet...")
+    result <- tryCatch({
+      tbl <- player_results()
+      req(nrow(tbl) > 0)
+      ss_id <- extract_sheet_id(input$sheet_url)
+      sheet_url <- push_results_to_sheet(tbl, ss_id)
+      list(ok = TRUE, msg = paste0("Results pushed successfully.\n", sheet_url))
+    }, error = function(e) {
+      list(ok = FALSE, msg = paste0("Push failed: ", conditionMessage(e)))
+    })
+
+    if (result$ok) {
+      showNotification("Results pushed to Google Sheet.", type = "message", duration = 5)
+    } else {
+      showNotification(result$msg, type = "error", duration = 8)
+    }
+    sheet_push_status(result$msg)
+  }, ignoreInit = TRUE)
   
   # No-op observer just to register keepalive input (so it shows as active)
   observeEvent(input$keepalive, { }, ignoreInit = TRUE)
