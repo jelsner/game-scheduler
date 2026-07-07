@@ -19,6 +19,16 @@ if (file.exists(".Renviron")) {
 
 # ---------- Helpers ------------------------------------------------------------
 
+google_service_account_email <- function() {
+  sa <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+  if (!nzchar(sa)) sa <- "secrets/game-scheduler-service-account.json"
+  if (file.exists(sa)) {
+    email <- tryCatch(jsonlite::fromJSON(sa)$client_email, error = function(e) NULL)
+    if (!is.null(email) && nzchar(email)) return(email)
+  }
+  "ddc-scheduler@game-scheduler-501709.iam.gserviceaccount.com"
+}
+
 # Keep player indices so we can derive byes automatically
 mk_games_df <- function(p, specs) {
   rounds <- purrr::map_int(specs, ~ as.integer(.x$round))
@@ -387,9 +397,18 @@ ui <- fluidPage(
       ),
       actionButton("push_sheets", "Push Results to Google Sheet", class = "btn-success"),
       helpText(
-        "Share the sheet with your Google account or service account before pushing.",
-        tags$br(),
-        "Optional env vars: GOOGLE_SHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON"
+        tags$strong("To push to your own Google Sheet:"),
+        tags$ol(
+          tags$li("Create a sheet and paste its URL above."),
+          tags$li(
+            "Share the sheet with ",
+            tags$code(google_service_account_email()),
+            " as Editor (you can uncheck \"Notify people\")."
+          ),
+          tags$li("Click ", tags$strong("Push Results to Google Sheet"), ".")
+        ),
+        "Leave the URL blank to use the default sheet. ",
+        "Results are written to the ", tags$strong("DDC Results"), " tab."
       ),
       verbatimTextOutput("sheet_push_status")
     ),
