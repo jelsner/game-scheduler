@@ -380,13 +380,11 @@ ui <- fluidPage(
   
   sidebarLayout(
     sidebarPanel(
-      h4("1) Enter players in rank order (one per line)"),
+      h4("1) Enter players in seeded order (one per line)"),
       textAreaInput("players_raw", NULL,
                     placeholder = "Jim\nHank\nScott\nDrew\n…", rows = 10),
       actionButton("make_schedule", "Generate Schedule", class = "btn-primary"),
       br(), br(),
-      h4("2) Options"),
-      checkboxInput("compact_names", "Compact team display (initials)", FALSE),
       hr(),
       h4("Google Sheet"),
       textInput(
@@ -439,13 +437,6 @@ server <- function(input, output, session) {
   schedule <- eventReactive(input$make_schedule, {
     make_schedule(players_vec())
   }, ignoreInit = TRUE)
-  
-  # team label helper
-  team_label <- function(txt) {
-    if (!isTRUE(input$compact_names)) return(txt)
-    ppl <- str_split(txt, " / ")[[1]]
-    paste(str_replace_all(ppl, "(\\b\\w)\\w*", "\\1."), collapse = " / ")
-  }
   
   # Collect scores directly from inputs (updates instantly as you type)
   scores_tbl <- reactive({
@@ -528,8 +519,8 @@ server <- function(input, output, session) {
             column(
               7,
               strong(sprintf("Game %d (Court %d):", gid, sub$court[i])),
-              div(sprintf("Team A: %s", team_label(sub$teamA[i]))),
-              div(sprintf("Team B: %s", team_label(sub$teamB[i]))),
+              div(sprintf("Team A: %s", sub$teamA[i])),
+              div(sprintf("Team B: %s", sub$teamB[i])),
               if (!is.null(round_byes)) div(class="bye-line", round_byes)
             ),
             column(
