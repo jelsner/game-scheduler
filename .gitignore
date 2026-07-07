@@ -28,8 +28,8 @@ vignettes/*.pdf
 # OAuth2 token, see https://github.com/hadley/httr/releases/tag/v0.3
 .httr-oauth
 
-# Google API credentials
-.secrets/
+# Google API credentials (gitignored; bundled with shinyapps.io deploy)
+secrets/
 *service-account*.json
 
 # knitr and R markdown default cache directories

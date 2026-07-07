@@ -13,6 +13,10 @@ library(DT)
 library(jsonlite)
 library(googlesheets4)
 
+if (file.exists(".Renviron")) {
+  readRenviron(".Renviron")
+}
+
 # ---------- Helpers ------------------------------------------------------------
 
 # Keep player indices so we can derive byes automatically
@@ -238,7 +242,7 @@ compute_player_results <- function(players, schedule_games, scores_tbl) {
     na.rm = TRUE
   )
 
-  base %>%
+  tbl <- base %>%
     left_join(records, by = c("Player" = "player")) %>%
     left_join(round_wide, by = c("Player" = "player")) %>%
     mutate(
@@ -246,6 +250,29 @@ compute_player_results <- function(players, schedule_games, scores_tbl) {
       Losses = replace_na(Losses, 0L)
     ) %>%
     select(Player, Wins, Losses, `Win %`, all_of(round_cols_order), Total)
+
+  add_final_ranking(tbl)
+}
+
+add_final_ranking <- function(tbl) {
+  ranked <- tbl %>%
+    mutate(
+      .win = replace_na(`Win %`, -1),
+      .tot = replace_na(Total, -Inf)
+    ) %>%
+    arrange(desc(.win), desc(.tot), Player) %>%
+    mutate(.pos = row_number())
+
+  tie_info <- ranked %>%
+    group_by(.win, .tot) %>%
+    summarise(.start_pos = min(.pos), .n = n(), .groups = "drop")
+
+  ranked %>%
+    left_join(tie_info, by = c(".win", ".tot")) %>%
+    mutate(
+      Rank = if_else(.n > 1L, "Shootout", as.character(.start_pos))
+    ) %>%
+    select(Rank, Player, Wins, Losses, `Win %`, dplyr::everything(), -`.win`, -`.tot`, -`.pos`, -`.start_pos`, -`.n`)
 }
 
 extract_sheet_id <- function(url_or_id) {
@@ -269,23 +296,36 @@ extract_sheet_id <- function(url_or_id) {
 
 gs_auth <- function() {
   sa <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-  if (nzchar(sa)) {
-    gs4_deauth()
-    if (file.exists(sa)) {
-      gs4_auth(path = sa)
-    } else if (grepl("^\\s*\\{", sa)) {
-      tmp <- tempfile(fileext = ".json")
-      writeLines(sa, tmp)
-      on.exit(unlink(tmp), add = TRUE)
-      gs4_auth(path = tmp)
-    } else {
-      stop("GOOGLE_SERVICE_ACCOUNT_JSON must be a file path or JSON content.")
-    }
+  if (!nzchar(sa)) {
+    sa <- "secrets/game-scheduler-service-account.json"
+  }
+
+  gs4_deauth()
+
+  if (file.exists(sa)) {
+    gs4_auth(path = sa, cache = FALSE)
     return(invisible(TRUE))
   }
 
-  gs4_auth(email = TRUE)
-  invisible(TRUE)
+  if (grepl("^\\s*\\{", sa)) {
+    creds <- jsonlite::fromJSON(sa, simplifyVector = FALSE)
+    gs4_auth(
+      credentials = gargle::credentials_service_account(info = creds),
+      cache = FALSE
+    )
+    return(invisible(TRUE))
+  }
+
+  if (interactive()) {
+    gs4_auth(email = TRUE)
+    return(invisible(TRUE))
+  }
+
+  stop(
+    "Google Sheets credentials are not configured on the server. ",
+    "Add secrets/game-scheduler-service-account.json and a project .Renviron, then redeploy.",
+    call. = FALSE
+  )
 }
 
 push_results_to_sheet <- function(results_tbl, sheet_id, sheet_name = "DDC Results") {
@@ -504,7 +544,12 @@ server <- function(input, output, session) {
       extensions = "Buttons",
       options = list(dom = "Bfrtip", buttons = c("copy", "csv"), pageLength = 25)
     ) %>%
-      formatPercentage("Win %", digits = 1)
+      formatPercentage("Win %", digits = 1) %>%
+      formatStyle(
+        "Rank",
+        fontWeight = styleEqual("Shootout", "bold"),
+        color = styleEqual("Shootout", "#b45309")
+      )
   })
 
   output$sheet_push_status <- renderText({
