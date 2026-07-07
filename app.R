@@ -380,7 +380,7 @@ ui <- fluidPage(
   
   sidebarLayout(
     sidebarPanel(
-      h4("1) Enter players in seeded order (one per line)"),
+      h4("Enter players in seeded order (one per line)"),
       textAreaInput("players_raw", NULL,
                     placeholder = "Jim\nHank\nScott\nDrew\n…", rows = 10),
       actionButton("make_schedule", "Generate Schedule", class = "btn-primary"),
