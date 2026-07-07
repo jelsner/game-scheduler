@@ -268,10 +268,19 @@ extract_sheet_id <- function(url_or_id) {
 }
 
 gs_auth <- function() {
-  sa_path <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-  if (nzchar(sa_path) && file.exists(sa_path)) {
+  sa <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+  if (nzchar(sa)) {
     gs4_deauth()
-    gs4_auth(path = sa_path)
+    if (file.exists(sa)) {
+      gs4_auth(path = sa)
+    } else if (grepl("^\\s*\\{", sa)) {
+      tmp <- tempfile(fileext = ".json")
+      writeLines(sa, tmp)
+      on.exit(unlink(tmp), add = TRUE)
+      gs4_auth(path = tmp)
+    } else {
+      stop("GOOGLE_SERVICE_ACCOUNT_JSON must be a file path or JSON content.")
+    }
     return(invisible(TRUE))
   }
 
