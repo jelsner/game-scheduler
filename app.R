@@ -760,6 +760,10 @@ server <- function(input, output, session) {
     sch  <- schedule()$games
     byes <- schedule()$byes  # tibble(round, byes) or NULL
     elems <- list()
+    score_value <- function(prefix, gid) {
+      value <- input[[paste0(prefix, "_", gid)]]
+      if (is.null(value)) NA else value
+    }
 
     sections <- sch %>%
       distinct(phase, group) %>%
@@ -800,10 +804,10 @@ server <- function(input, output, session) {
               column(
                 5,
                 div(class = "score-box small-input",
-                    numericInput(paste0("A_", gid), "A", value = NA, min = 0, step = 1)
+                    numericInput(paste0("A_", gid), "A", value = score_value("A", gid), min = 0, step = 1)
                 ),
                 div(class = "score-box small-input",
-                    numericInput(paste0("B_", gid), "B", value = NA, min = 0, step = 1)
+                    numericInput(paste0("B_", gid), "B", value = score_value("B", gid), min = 0, step = 1)
                 )
               )
             ),
