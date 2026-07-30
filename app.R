@@ -1,5 +1,5 @@
 # app.R
-# DDC / Escape!! ranked pairings + scoring (4–10 players)
+# DDC / Escape!! ranked pairings + scoring (4–11 players)
 # Field-proofed: autosave to LocalStorage, autoreconnect, heartbeat keep-alive,
 # round-based per-player differentials, two-court rounds collapsed by round.
 
@@ -173,8 +173,38 @@ make_schedule <- function(players) {
       list(round=11, court=1, A=c(1,4),  B=c(2,3)),
       list(round=11, court=2, A=c(6,10), B=c(7,9))
     )
+  } else if (n == 11) {
+    specs <- list(
+      list(round=1,  court=1, A=c(1,3),  B=c(9,11)),
+      list(round=2,  court=1, A=c(1,8),  B=c(4,5)),
+      list(round=2,  court=2, A=c(2,7),  B=c(3,6)),
+      list(round=3,  court=1, A=c(8,11), B=c(9,10)),
+      list(round=3,  court=2, A=c(1,7),  B=c(2,5)),
+      list(round=4,  court=1, A=c(7,11), B=c(8,10)),
+      list(round=4,  court=2, A=c(1,6),  B=c(3,4)),
+      list(round=5,  court=1, A=c(4,9),  B=c(10,11)),
+      list(round=5,  court=2, A=c(2,6),  B=c(3,5)),
+      list(round=6,  court=1, A=c(7,10), B=c(8,9)),
+      list(round=6,  court=2, A=c(1,5),  B=c(2,4)),
+      list(round=7,  court=1, A=c(3,9),  B=c(4,7)),
+      list(round=7,  court=2, A=c(5,11), B=c(6,10)),
+      list(round=8,  court=1, A=c(1,11), B=c(4,8)),
+      list(round=8,  court=2, A=c(2,10), B=c(5,7)),
+      list(round=9,  court=1, A=c(3,11), B=c(4,10)),
+      list(round=9,  court=2, A=c(5,9),  B=c(6,8)),
+      list(round=10, court=1, A=c(1,9),  B=c(3,7)),
+      list(round=10, court=2, A=c(2,8),  B=c(4,6)),
+      list(round=11, court=1, A=c(2,11), B=c(6,7)),
+      list(round=11, court=2, A=c(3,10), B=c(5,8)),
+      list(round=12, court=1, A=c(1,10), B=c(5,6)),
+      list(round=12, court=2, A=c(2,9),  B=c(3,8)),
+      list(round=13, court=1, A=c(4,11), B=c(6,9)),
+      list(round=13, court=2, A=c(5,10), B=c(7,8)),
+      list(round=14, court=1, A=c(6,11), B=c(7,9)),
+      list(round=14, court=2, A=c(1,4),  B=c(2,3))
+    )
   } else {
-    shiny::validate(shiny::need(FALSE, "This app currently supports ranked schedules for 4–10 players."))
+    shiny::validate(shiny::need(FALSE, "This app currently supports ranked schedules for 4-11 players."))
   }
   
   games <- mk_games_df(p, specs)
@@ -376,7 +406,7 @@ ui <- fluidPage(
       Shiny.setInputValue('saved_state', raw || null, {priority:'event'});
     });
   ")),
-  titlePanel("DDC / Escape!! — Ranked Pairings & Scores (4–10 players)"),
+  titlePanel("DDC / Escape!! - Ranked Pairings & Scores (4-11 players)"),
   
   sidebarLayout(
     sidebarPanel(
@@ -429,8 +459,8 @@ server <- function(input, output, session) {
     req(input$players_raw)
     x <- str_split(input$players_raw, "\\r?\\n")[[1]] |> str_trim()
     x <- x[nzchar(x)]
-    shiny::validate(shiny::need(length(x) >= 4, "Please enter at least 4 players (up to 10 supported)."))
-    shiny::validate(shiny::need(length(x) <= 10, "Please limit to 10 players for this version."))
+    shiny::validate(shiny::need(length(x) >= 4, "Please enter at least 4 players (up to 11 supported)."))
+    shiny::validate(shiny::need(length(x) <= 11, "Please limit to 11 players for this version."))
     x
   })
   
