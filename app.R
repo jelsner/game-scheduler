@@ -17,6 +17,10 @@ if (file.exists(".Renviron")) {
   readRenviron(".Renviron")
 }
 
+`%||%` <- function(x, y) {
+  if (is.null(x)) y else x
+}
+
 # ---------- Helpers ------------------------------------------------------------
 
 google_service_account_email <- function() {
@@ -213,6 +217,184 @@ make_schedule <- function(players) {
     games = games %>% arrange(round, court, game_id),
     byes  = byes_tbl
   )
+}
+
+add_schedule_context <- function(schedule, phase, group, game_offset = 0, court_offset = 0) {
+  games <- schedule$games %>%
+    mutate(
+      game_id = game_id + game_offset,
+      court = court + court_offset,
+      phase = phase,
+      group = group
+    ) %>%
+    select(game_id, phase, group, round, court, dplyr::everything())
+
+  byes <- schedule$byes
+  if (!is.null(byes)) {
+    byes <- byes %>%
+      mutate(phase = phase, group = group) %>%
+      select(phase, group, round, byes)
+  }
+
+  list(games = games, byes = byes)
+}
+
+snake_groups <- function(players) {
+  n <- length(players)
+  group_sizes <- c(floor(n / 2), ceiling(n / 2))
+  groups <- list(character(), character())
+
+  for (seed in seq_along(players)) {
+    row <- ceiling(seed / 2)
+    order <- if (row %% 2 == 1) c(1, 2) else c(2, 1)
+    target_group <- if (seed %% 2 == 1) order[1] else order[2]
+
+    if (length(groups[[target_group]]) >= group_sizes[target_group]) {
+      target_group <- 3 - target_group
+    }
+
+    groups[[target_group]] <- c(groups[[target_group]], players[seed])
+  }
+
+  names(groups) <- c("Group A", "Group B")
+  groups
+}
+
+make_two_group_prelim_schedule <- function(players) {
+  groups <- snake_groups(players)
+  parts <- list()
+  game_offset <- 0
+
+  for (idx in seq_along(groups)) {
+    sch <- make_schedule(groups[[idx]])
+    part <- add_schedule_context(
+      sch,
+      phase = "Preliminary",
+      group = names(groups)[idx],
+      game_offset = game_offset,
+      court_offset = idx - 1
+    )
+    parts[[idx]] <- part
+    game_offset <- max(part$games$game_id)
+  }
+
+  list(
+    games = bind_rows(purrr::map(parts, "games")) %>% arrange(phase, round, court, game_id),
+    byes = bind_rows(purrr::map(parts, "byes")),
+    groups = groups
+  )
+}
+
+scores_for_games <- function(games, input) {
+  pull_val <- function(id) {
+    v <- input[[id]]
+    if (is.null(v)) NA_real_ else as.numeric(v)
+  }
+
+  tibble(
+    game_id = games$game_id,
+    scoreA = sapply(games$game_id, function(gid) pull_val(paste0("A_", gid))),
+    scoreB = sapply(games$game_id, function(gid) pull_val(paste0("B_", gid)))
+  )
+}
+
+games_complete <- function(scores_tbl) {
+  nrow(scores_tbl) > 0 && all(!is.na(scores_tbl$scoreA) & !is.na(scores_tbl$scoreB))
+}
+
+ranked_players_for_group <- function(players, games, scores_tbl) {
+  compute_player_results(players, games, scores_tbl) %>% pull(Player)
+}
+
+make_two_group_finals_schedule <- function(prelim_schedule, prelim_scores) {
+  if (!games_complete(prelim_scores)) return(NULL)
+
+  group_names <- names(prelim_schedule$groups)
+  rankings <- purrr::map(group_names, function(group_name) {
+    group_games <- prelim_schedule$games %>% filter(group == group_name)
+    group_scores <- prelim_scores %>% semi_join(group_games, by = "game_id")
+    ranked_players_for_group(prelim_schedule$groups[[group_name]], group_games, group_scores)
+  })
+  names(rankings) <- group_names
+
+  championship_players <- c(rankings[[1]][1], rankings[[2]][1], rankings[[1]][2], rankings[[2]][2])
+  consolation_players <- character()
+  max_rank <- max(length(rankings[[1]]), length(rankings[[2]]))
+  for (rank in seq(3, max_rank)) {
+    if (rank <= length(rankings[[1]])) consolation_players <- c(consolation_players, rankings[[1]][rank])
+    if (rank <= length(rankings[[2]])) consolation_players <- c(consolation_players, rankings[[2]][rank])
+  }
+
+  game_offset <- max(prelim_schedule$games$game_id)
+  championship <- add_schedule_context(
+    make_schedule(championship_players),
+    phase = "Finals",
+    group = "Championship Final",
+    game_offset = game_offset,
+    court_offset = 0
+  )
+
+  consolation <- add_schedule_context(
+    make_schedule(consolation_players),
+    phase = "Finals",
+    group = "Consolation Final",
+    game_offset = max(championship$games$game_id),
+    court_offset = 1
+  )
+
+  list(
+    games = bind_rows(championship$games, consolation$games) %>% arrange(phase, round, court, game_id),
+    byes = bind_rows(championship$byes, consolation$byes),
+    championship_players = championship_players,
+    consolation_players = consolation_players
+  )
+}
+
+offset_numeric_ranks <- function(tbl, offset) {
+  tbl %>%
+    mutate(
+      Rank = case_when(
+        Rank == "Shootout" ~ Rank,
+        TRUE ~ as.character(suppressWarnings(as.integer(Rank)) + offset)
+      )
+    )
+}
+
+compute_two_group_results <- function(prelim_schedule, prelim_scores, finals_schedule, all_scores) {
+  if (is.null(finals_schedule)) {
+    group_names <- names(prelim_schedule$groups)
+    return(bind_rows(purrr::map(group_names, function(group_name) {
+      group_games <- prelim_schedule$games %>% filter(group == group_name)
+      group_scores <- prelim_scores %>% semi_join(group_games, by = "game_id")
+      compute_player_results(prelim_schedule$groups[[group_name]], group_games, group_scores) %>%
+        mutate(Group = group_name) %>%
+        select(Group, dplyr::everything())
+    })))
+  }
+
+  championship_games <- finals_schedule$games %>% filter(group == "Championship Final")
+  championship_scores <- all_scores %>% semi_join(championship_games, by = "game_id")
+  consolation_games <- finals_schedule$games %>% filter(group == "Consolation Final")
+  consolation_scores <- all_scores %>% semi_join(consolation_games, by = "game_id")
+
+  championship <- compute_player_results(
+    finals_schedule$championship_players,
+    championship_games,
+    championship_scores
+  ) %>%
+    mutate(Group = "Championship Final") %>%
+    select(Group, dplyr::everything())
+
+  consolation <- compute_player_results(
+    finals_schedule$consolation_players,
+    consolation_games,
+    consolation_scores
+  ) %>%
+    offset_numeric_ranks(4) %>%
+    mutate(Group = "Consolation Final") %>%
+    select(Group, dplyr::everything())
+
+  bind_rows(championship, consolation)
 }
 
 # ---------- Scoring / Spreadsheet (by ROUND) ----------------------------------
@@ -413,6 +595,15 @@ ui <- fluidPage(
       h4("Enter players in seeded order (one per line)"),
       textAreaInput("players_raw", NULL,
                     placeholder = "Jim\nHank\nScott\nDrew\n…", rows = 10),
+      radioButtons(
+        "format_mode",
+        "Format",
+        choices = c(
+          "Single MoC" = "single",
+          "Two groups + finals" = "two_group"
+        ),
+        selected = "single"
+      ),
       actionButton("make_schedule", "Generate Schedule", class = "btn-primary"),
       br(), br(),
       hr(),
@@ -464,20 +655,47 @@ server <- function(input, output, session) {
     x
   })
   
-  schedule <- eventReactive(input$make_schedule, {
-    make_schedule(players_vec())
+  prelim_schedule <- eventReactive(input$make_schedule, {
+    players <- players_vec()
+    mode <- input$format_mode %||% "single"
+
+    if (mode == "two_group") {
+      shiny::validate(shiny::need(length(players) >= 8, "Two-group format requires at least 8 players."))
+      make_two_group_prelim_schedule(players)
+    } else {
+      add_schedule_context(make_schedule(players), phase = "Main", group = "All")
+    }
   }, ignoreInit = TRUE)
-  
+
+  prelim_scores_tbl <- reactive({
+    req(prelim_schedule())
+    scores_for_games(prelim_schedule()$games, input)
+  })
+
+  finals_schedule <- reactive({
+    req(prelim_schedule())
+    mode <- input$format_mode %||% "single"
+    if (mode != "two_group") return(NULL)
+    make_two_group_finals_schedule(prelim_schedule(), prelim_scores_tbl())
+  })
+
+  schedule <- reactive({
+    req(prelim_schedule())
+    finals <- finals_schedule()
+    if (is.null(finals)) return(prelim_schedule())
+
+    list(
+      games = bind_rows(prelim_schedule()$games, finals$games) %>%
+        arrange(factor(phase, levels = c("Main", "Preliminary", "Finals")), group, round, court, game_id),
+      byes = bind_rows(prelim_schedule()$byes, finals$byes),
+      groups = prelim_schedule()$groups
+    )
+  })
+
   # Collect scores directly from inputs (updates instantly as you type)
   scores_tbl <- reactive({
     req(schedule())
-    gms <- schedule()$games
-    pull_val <- function(id) { v <- input[[id]]; if (is.null(v)) NA_real_ else as.numeric(v) }
-    tibble(
-      game_id = gms$game_id,
-      scoreA  = sapply(gms$game_id, function(gid) pull_val(paste0("A_", gid))),
-      scoreB  = sapply(gms$game_id, function(gid) pull_val(paste0("B_", gid)))
-    )
+    scores_for_games(schedule()$games, input)
   })
   
   # AUTO-SAVE state to LocalStorage whenever players/scores/schedule change
@@ -485,6 +703,7 @@ server <- function(input, output, session) {
     if (is.null(schedule())) return()
     st <- list(
       players_raw = if (!is.null(input$players_raw)) input$players_raw else "",
+      format_mode = input$format_mode %||% "single",
       scores = scores_tbl() |> as.list()  # list of columns: game_id, scoreA, scoreB
     )
     session$sendCustomMessage("saveState", st)
@@ -506,6 +725,10 @@ server <- function(input, output, session) {
         (is.null(input$players_raw) || !nzchar(input$players_raw))) {
       updateTextAreaInput(session, "players_raw", value = dat$players_raw)
     }
+
+    if (!is.null(dat$format_mode) && dat$format_mode %in% c("single", "two_group")) {
+      updateRadioButtons(session, "format_mode", selected = dat$format_mode)
+    }
     
     # After schedule is generated, restore scores to inputs
     observeEvent(schedule(), {
@@ -520,7 +743,7 @@ server <- function(input, output, session) {
           }
         }
       }
-    }, once = TRUE)
+    })
   }, ignoreInit = FALSE)
   
   # Build the schedule UI (with byes under Team B)
@@ -528,43 +751,57 @@ server <- function(input, output, session) {
     req(schedule())
     sch  <- schedule()$games
     byes <- schedule()$byes  # tibble(round, byes) or NULL
-    
-    rounds <- sort(unique(sch$round))
     elems <- list()
-    
-    for (r in rounds) {
-      sub <- sch %>% dplyr::filter(round == r) %>% dplyr::arrange(court)
-      elems <- append(elems, list(div(class="round-header", strong(sprintf("Round %d", r)))))
-      
-      round_byes <- NULL
-      if (!is.null(byes)) {
-        b <- byes %>% dplyr::filter(round == r)
-        if (nrow(b) == 1 && !is.na(b$byes) && nzchar(b$byes)) round_byes <- paste0("Byes: ", b$byes)
+
+    sections <- sch %>%
+      distinct(phase, group) %>%
+      arrange(factor(phase, levels = c("Main", "Preliminary", "Finals")), group)
+
+    for (section_idx in seq_len(nrow(sections))) {
+      phase_name <- sections$phase[section_idx]
+      group_name <- sections$group[section_idx]
+      section_games <- sch %>%
+        filter(phase == phase_name, group == group_name) %>%
+        arrange(round, court, game_id)
+
+      if (!(phase_name == "Main" && group_name == "All")) {
+        elems <- append(elems, list(h4(sprintf("%s - %s", phase_name, group_name))))
       }
-      
-      for (i in seq_len(nrow(sub))) {
-        gid <- sub$game_id[i]
-        elems <- append(elems, list(
-          fluidRow(
-            column(
-              7,
-              strong(sprintf("Game %d (Court %d):", gid, sub$court[i])),
-              div(sprintf("Team A: %s", sub$teamA[i])),
-              div(sprintf("Team B: %s", sub$teamB[i])),
-              if (!is.null(round_byes)) div(class="bye-line", round_byes)
-            ),
-            column(
-              5,
-              div(class = "score-box small-input",
-                  numericInput(paste0("A_", gid), "A", value = NA, min = 0, step = 1)
+
+      for (r in sort(unique(section_games$round))) {
+        sub <- section_games %>% dplyr::filter(round == r) %>% dplyr::arrange(court)
+        elems <- append(elems, list(div(class="round-header", strong(sprintf("Round %d", r)))))
+
+        round_byes <- NULL
+        if (!is.null(byes)) {
+          b <- byes %>% dplyr::filter(phase == phase_name, group == group_name, round == r)
+          if (nrow(b) == 1 && !is.na(b$byes) && nzchar(b$byes)) round_byes <- paste0("Byes: ", b$byes)
+        }
+
+        for (i in seq_len(nrow(sub))) {
+          gid <- sub$game_id[i]
+          elems <- append(elems, list(
+            fluidRow(
+              column(
+                7,
+                strong(sprintf("Game %d (Court %d):", gid, sub$court[i])),
+                div(sprintf("Team A: %s", sub$teamA[i])),
+                div(sprintf("Team B: %s", sub$teamB[i])),
+                if (!is.null(round_byes)) div(class="bye-line", round_byes)
               ),
-              div(class = "score-box small-input",
-                  numericInput(paste0("B_", gid), "B", value = NA, min = 0, step = 1)
+              column(
+                5,
+                div(class = "score-box small-input",
+                    numericInput(paste0("A_", gid), "A", value = NA, min = 0, step = 1)
+                ),
+                div(class = "score-box small-input",
+                    numericInput(paste0("B_", gid), "B", value = NA, min = 0, step = 1)
+                )
               )
-            )
-          ),
-          hr()
-        ))
+            ),
+            hr()
+          ))
+        }
       }
     }
     do.call(tagList, elems)
@@ -572,6 +809,9 @@ server <- function(input, output, session) {
   
   player_results <- reactive({
     req(schedule())
+    if ((input$format_mode %||% "single") == "two_group") {
+      return(compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), finals_schedule(), scores_tbl()))
+    }
     compute_player_results(players_vec(), schedule()$games, scores_tbl())
   })
 
