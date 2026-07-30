@@ -239,6 +239,14 @@ add_schedule_context <- function(schedule, phase, group, game_offset = 0, court_
   list(games = games, byes = byes)
 }
 
+bind_byes <- function(...) {
+  byes <- bind_rows(...)
+  if (nrow(byes) == 0 || !all(c("phase", "group", "round", "byes") %in% names(byes))) {
+    return(NULL)
+  }
+  byes
+}
+
 snake_groups <- function(players) {
   n <- length(players)
   group_sizes <- c(floor(n / 2), ceiling(n / 2))
@@ -280,7 +288,7 @@ make_two_group_prelim_schedule <- function(players) {
 
   list(
     games = bind_rows(purrr::map(parts, "games")) %>% arrange(phase, round, court, game_id),
-    byes = bind_rows(purrr::map(parts, "byes")),
+    byes = bind_byes(purrr::map(parts, "byes")),
     groups = groups
   )
 }
@@ -344,7 +352,7 @@ make_two_group_finals_schedule <- function(prelim_schedule, prelim_scores) {
 
   list(
     games = bind_rows(championship$games, consolation$games) %>% arrange(phase, round, court, game_id),
-    byes = bind_rows(championship$byes, consolation$byes),
+    byes = bind_byes(championship$byes, consolation$byes),
     championship_players = championship_players,
     consolation_players = consolation_players
   )
@@ -687,7 +695,7 @@ server <- function(input, output, session) {
     list(
       games = bind_rows(prelim_schedule()$games, finals$games) %>%
         arrange(factor(phase, levels = c("Main", "Preliminary", "Finals")), group, round, court, game_id),
-      byes = bind_rows(prelim_schedule()$byes, finals$byes),
+      byes = bind_byes(prelim_schedule()$byes, finals$byes),
       groups = prelim_schedule()$groups
     )
   })
