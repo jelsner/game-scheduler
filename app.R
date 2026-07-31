@@ -679,6 +679,7 @@ gs_auth <- function() {
 push_results_to_sheet <- function(results_tbl, sheet_id, sheet_name = "DDC Results") {
   gs_auth()
   sheet_write(results_tbl, ss = sheet_id, sheet = sheet_name)
+  format_results_sheet(sheet_id, sheet_name, results_tbl)
   props <- sheet_properties(sheet_id)
   gid <- props$sheet_id[props$name == sheet_name]
   if (length(gid) == 1 && !is.na(gid)) {
@@ -690,8 +691,83 @@ push_results_to_sheet <- function(results_tbl, sheet_id, sheet_name = "DDC Resul
 
 push_result_tabs_to_sheet <- function(tabs, sheet_id) {
   gs_auth()
-  purrr::iwalk(tabs, ~ sheet_write(.x, ss = sheet_id, sheet = .y))
+  purrr::iwalk(tabs, function(tbl, sheet_name) {
+    sheet_write(tbl, ss = sheet_id, sheet = sheet_name)
+    format_results_sheet(sheet_id, sheet_name, tbl)
+  })
   paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
+}
+
+format_results_sheet <- function(sheet_id, sheet_name, results_tbl) {
+  col_letter <- function(idx) {
+    letters <- character()
+    while (idx > 0) {
+      rem <- (idx - 1L) %% 26L
+      letters <- c(LETTERS[rem + 1L], letters)
+      idx <- (idx - rem - 1L) %/% 26L
+    }
+    paste0(letters, collapse = "")
+  }
+
+  col_range <- function(col_name) {
+    letter <- col_letter(match(col_name, names(results_tbl)))
+    paste0(letter, ":", letter)
+  }
+
+  apply_format <- function(range, ...) {
+    cell <- googlesheets4:::CellData(
+      userEnteredFormat = do.call(
+        googlesheets4:::new,
+        c(list("CellFormat"), list(...))
+      )
+    )
+    range_flood(sheet_id, sheet = sheet_name, range = range, cell = cell)
+  }
+
+  apply_format(
+    "1:1",
+    horizontalAlignment = "CENTER",
+    textFormat = list(bold = TRUE)
+  )
+
+  text_cols <- intersect(c("Group", "Player"), names(results_tbl))
+  for (col in text_cols) {
+    apply_format(
+      col_range(col),
+      horizontalAlignment = "LEFT"
+    )
+  }
+
+  centered_cols <- setdiff(names(results_tbl), text_cols)
+  for (col in centered_cols) {
+    apply_format(
+      col_range(col),
+      horizontalAlignment = "CENTER"
+    )
+  }
+
+  if ("Win %" %in% names(results_tbl)) {
+    apply_format(
+      col_range("Win %"),
+      horizontalAlignment = "CENTER",
+      numberFormat = list(type = "PERCENT", pattern = "0.00%")
+    )
+  }
+
+  numeric_cols <- setdiff(
+    names(results_tbl)[vapply(results_tbl, is.numeric, logical(1))],
+    "Win %"
+  )
+  for (col in numeric_cols) {
+    apply_format(
+      col_range(col),
+      horizontalAlignment = "CENTER",
+      numberFormat = list(type = "NUMBER", pattern = "0")
+    )
+  }
+
+  range_autofit(sheet_id, sheet = sheet_name, dimension = "columns")
+  invisible(TRUE)
 }
 
 # ---------- UI ----------------------------------------------------------------
@@ -739,6 +815,11 @@ ui <- fluidPage(
       actionButton("make_schedule", "Generate Schedule", class = "btn-primary"),
       br(), br(),
       hr(),
+      h4("Scorekeeper"),
+      passwordInput("admin_password", "Admin password"),
+      actionButton("unlock_admin", "Unlock scorekeeping", class = "btn-warning"),
+      uiOutput("admin_status"),
+      hr(),
       h4("Google Sheet"),
       textInput(
         "sheet_url",
@@ -779,6 +860,39 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   session$allowReconnect(TRUE)  # allow automatic reconnect
   schedule_version <- reactiveVal(0)
+  admin_unlocked <- reactiveVal(FALSE)
+
+  observe({
+    controls <- c("push_sheets")
+    purrr::walk(controls, ~ {
+      if (admin_unlocked()) shinyjs::enable(.x) else shinyjs::disable(.x)
+    })
+  })
+
+  observeEvent(input$unlock_admin, {
+    expected <- Sys.getenv("SCOREKEEPER_PASSWORD", "")
+    if (!nzchar(expected)) {
+      showNotification("SCOREKEEPER_PASSWORD is not configured.", type = "error", duration = 8)
+      return()
+    }
+
+    if (identical(input$admin_password, expected)) {
+      admin_unlocked(TRUE)
+      shinyjs::disable("admin_password")
+      shinyjs::disable("unlock_admin")
+      showNotification("Scorekeeping unlocked.", type = "message", duration = 5)
+    } else {
+      showNotification("Incorrect admin password.", type = "error", duration = 5)
+    }
+  }, ignoreInit = TRUE)
+
+  output$admin_status <- renderUI({
+    if (admin_unlocked()) {
+      tags$p(class = "text-success", tags$strong("Scorekeeping unlocked."))
+    } else {
+      tags$p(class = "text-muted", "Schedule setup is open. Scorekeeping is locked.")
+    }
+  })
   
   players_vec <- reactive({
     req(input$players_raw)
@@ -900,6 +1014,16 @@ server <- function(input, output, session) {
       value <- input[[score_input_id(prefix, gid, schedule_version())]]
       if (is.null(value)) NA else value
     }
+    score_input <- function(prefix, gid) {
+      input_control <- numericInput(
+        score_input_id(prefix, gid, schedule_version()),
+        prefix,
+        value = score_value(prefix, gid),
+        min = 0,
+        step = 1
+      )
+      if (admin_unlocked()) input_control else shinyjs::disabled(input_control)
+    }
 
     sections <- sch %>%
       distinct(phase, group) %>%
@@ -928,24 +1052,30 @@ server <- function(input, output, session) {
 
         for (i in seq_len(nrow(sub))) {
           gid <- sub$game_id[i]
+          score_column <- if (admin_unlocked()) {
+            column(
+              5,
+              div(class = "score-box small-input",
+                  score_input("A", gid)
+              ),
+              div(class = "score-box small-input",
+                  score_input("B", gid)
+              )
+            )
+          } else {
+            NULL
+          }
+
           elems <- append(elems, list(
             fluidRow(
               column(
-                7,
+                if (admin_unlocked()) 7 else 12,
                 strong(sprintf("Game %d (Court %d):", gid, sub$court[i])),
                 div(sprintf("Team A: %s", sub$teamA[i])),
                 div(sprintf("Team B: %s", sub$teamB[i])),
                 if (!is.null(round_byes)) div(class="bye-line", round_byes)
               ),
-              column(
-                5,
-                div(class = "score-box small-input",
-                    numericInput(score_input_id("A", gid, schedule_version()), "A", value = score_value("A", gid), min = 0, step = 1)
-                ),
-                div(class = "score-box small-input",
-                    numericInput(score_input_id("B", gid, schedule_version()), "B", value = score_value("B", gid), min = 0, step = 1)
-                )
-              )
+              score_column
             ),
             hr()
           ))
@@ -981,6 +1111,7 @@ server <- function(input, output, session) {
   })
 
   output$shootout_resolution_ui <- renderUI({
+    if (!admin_unlocked()) return(NULL)
     groups <- current_shootout_groups()
     if (length(groups) == 0) return(NULL)
 
@@ -1090,6 +1221,7 @@ server <- function(input, output, session) {
   sheet_push_status <- reactiveVal("")
 
   observeEvent(input$push_sheets, {
+    req(admin_unlocked())
     sheet_push_status("Pushing results to Google Sheet...")
     result <- tryCatch({
       shootout_groups <- current_shootout_groups()
