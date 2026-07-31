@@ -293,7 +293,11 @@ make_two_group_prelim_schedule <- function(players) {
   )
 }
 
-scores_for_games <- function(games, input) {
+score_input_id <- function(prefix, gid, version) {
+  paste0(prefix, "_", version, "_", gid)
+}
+
+scores_for_games <- function(games, input, version) {
   pull_val <- function(id) {
     v <- input[[id]]
     if (is.null(v)) NA_real_ else as.numeric(v)
@@ -301,8 +305,8 @@ scores_for_games <- function(games, input) {
 
   tibble(
     game_id = games$game_id,
-    scoreA = sapply(games$game_id, function(gid) pull_val(paste0("A_", gid))),
-    scoreB = sapply(games$game_id, function(gid) pull_val(paste0("B_", gid)))
+    scoreA = sapply(games$game_id, function(gid) pull_val(score_input_id("A", gid, version))),
+    scoreB = sapply(games$game_id, function(gid) pull_val(score_input_id("B", gid, version)))
   )
 }
 
@@ -314,15 +318,21 @@ ranked_players_for_group <- function(players, games, scores_tbl) {
   compute_player_results(players, games, scores_tbl) %>% pull(Player)
 }
 
-make_two_group_finals_schedule <- function(prelim_schedule, prelim_scores) {
+make_two_group_finals_schedule <- function(prelim_schedule, prelim_scores, prelim_results = NULL) {
   if (!games_complete(prelim_scores)) return(NULL)
 
   group_names <- names(prelim_schedule$groups)
-  rankings <- purrr::map(group_names, function(group_name) {
-    group_games <- prelim_schedule$games %>% filter(group == group_name)
-    group_scores <- prelim_scores %>% semi_join(group_games, by = "game_id")
-    ranked_players_for_group(prelim_schedule$groups[[group_name]], group_games, group_scores)
-  })
+  if (is.null(prelim_results)) {
+    rankings <- purrr::map(group_names, function(group_name) {
+      group_games <- prelim_schedule$games %>% filter(group == group_name)
+      group_scores <- prelim_scores %>% semi_join(group_games, by = "game_id")
+      ranked_players_for_group(prelim_schedule$groups[[group_name]], group_games, group_scores)
+    })
+  } else {
+    rankings <- purrr::map(group_names, function(group_name) {
+      prelim_results %>% filter(Group == group_name) %>% pull(Player)
+    })
+  }
   names(rankings) <- group_names
 
   championship_players <- c(rankings[[1]][1], rankings[[2]][1], rankings[[1]][2], rankings[[2]][2])
@@ -405,6 +415,114 @@ compute_two_group_results <- function(prelim_schedule, prelim_scores, finals_sch
   bind_rows(championship, consolation)
 }
 
+find_shootout_groups <- function(results_tbl) {
+  if (!"Rank" %in% names(results_tbl) || !"Player" %in% names(results_tbl)) return(list())
+
+  group_cols <- intersect(c("Group", "Wins", "Losses", "Win %", "Total"), names(results_tbl))
+  groups_tbl <- results_tbl %>%
+    mutate(
+      .row_id = row_number(),
+      .seed = if ("Seed" %in% names(.)) Seed else row_number()
+    ) %>%
+    filter(Rank == "Shootout") %>%
+    group_by(across(all_of(group_cols))) %>%
+    filter(n() >= 2) %>%
+    summarise(
+      rows = list(.row_id),
+      players = list(Player),
+      seeds = list(.seed),
+      .groups = "drop"
+    )
+
+  if (nrow(groups_tbl) == 0) return(list())
+
+  groups_tbl %>%
+    mutate(
+      label = if ("Group" %in% names(.)) {
+        paste0(Group, " | ", Wins, " wins | ", Total, " point diff")
+      } else {
+        paste0(Wins, " wins | ", Total, " point diff")
+      },
+      id = paste0("shootout_", str_replace_all(str_to_lower(label), "[^a-z0-9]+", "_"), row_number())
+    ) %>%
+    split(seq_len(nrow(.)))
+}
+
+apply_shootout_resolutions <- function(results_tbl, shootout_groups, input) {
+  if (length(shootout_groups) == 0) return(results_tbl)
+
+  out <- results_tbl
+  for (group_info in shootout_groups) {
+    rows <- unlist(group_info$rows)
+    players <- unlist(group_info$players)
+    seeds <- unlist(group_info$seeds)
+    players <- players[order(seeds)]
+
+    if (length(players) == 3) {
+      top_seed <- players[1]
+      lower_seeds <- players[2:3]
+      first_winner <- input[[paste0(group_info$id, "_first_winner")]]
+      final_winner <- input[[paste0(group_info$id, "_final_winner")]]
+      if (is.null(first_winner) || is.null(final_winner) ||
+          !nzchar(first_winner) || !nzchar(final_winner) ||
+          !(first_winner %in% lower_seeds) ||
+          !(final_winner %in% c(top_seed, first_winner))) {
+        next
+      }
+      first_loser <- setdiff(lower_seeds, first_winner)
+      final_loser <- setdiff(c(top_seed, first_winner), final_winner)
+      resolved_players <- c(final_winner, final_loser, first_loser)
+    } else {
+      winner <- input[[paste0(group_info$id, "_winner")]]
+      loser <- input[[paste0(group_info$id, "_loser")]]
+      if (is.null(winner) || is.null(loser) || !nzchar(winner) || !nzchar(loser) || winner == loser) {
+        next
+      }
+
+      middle <- players[!(players %in% c(winner, loser))]
+      resolved_players <- c(winner, middle, loser)
+    }
+
+    out[rows, ] <- out[match(resolved_players, out$Player), ]
+    if ("Group" %in% names(out)) {
+      group_name <- out$Group[rows[1]]
+      group_rows <- which(out$Group == group_name)
+      start_rank <- match(min(rows), group_rows)
+    } else {
+      start_rank <- min(rows)
+    }
+    out$Rank[rows] <- as.character(seq(start_rank, start_rank + length(rows) - 1))
+  }
+
+  out
+}
+
+unresolved_shootout_labels <- function(shootout_groups, input) {
+  purrr::keep(shootout_groups, function(group_info) {
+    players <- unlist(group_info$players)
+    seeds <- unlist(group_info$seeds)
+    players <- players[order(seeds)]
+
+    if (length(players) == 3) {
+      top_seed <- players[1]
+      lower_seeds <- players[2:3]
+      first_winner <- input[[paste0(group_info$id, "_first_winner")]]
+      final_winner <- input[[paste0(group_info$id, "_final_winner")]]
+      return(
+        is.null(first_winner) || is.null(final_winner) ||
+          !nzchar(first_winner) || !nzchar(final_winner) ||
+          !(first_winner %in% lower_seeds) ||
+          !(final_winner %in% c(top_seed, first_winner))
+      )
+    }
+
+    winner <- input[[paste0(group_info$id, "_winner")]]
+    loser <- input[[paste0(group_info$id, "_loser")]]
+    is.null(winner) || is.null(loser) || !nzchar(winner) || !nzchar(loser) || winner == loser
+  }) %>%
+    purrr::map_chr("label")
+}
+
 # ---------- Scoring / Spreadsheet (by ROUND) ----------------------------------
 
 player_game_results <- function(schedule_games, scores_tbl) {
@@ -438,7 +556,7 @@ player_game_results <- function(schedule_games, scores_tbl) {
 compute_player_results <- function(players, schedule_games, scores_tbl) {
   game_results <- player_game_results(schedule_games, scores_tbl)
   round_cols_order <- paste0("Round ", sort(unique(schedule_games$round)))
-  base <- tibble(Player = players)
+  base <- tibble(Player = players, Seed = seq_along(players))
 
   records <- game_results %>%
     group_by(player) %>%
@@ -479,7 +597,7 @@ compute_player_results <- function(players, schedule_games, scores_tbl) {
       Wins = replace_na(Wins, 0L),
       Losses = replace_na(Losses, 0L)
     ) %>%
-    select(Player, Wins, Losses, `Win %`, all_of(round_cols_order), Total)
+    select(Player, Seed, Wins, Losses, `Win %`, all_of(round_cols_order), Total)
 
   add_final_ranking(tbl)
 }
@@ -502,7 +620,7 @@ add_final_ranking <- function(tbl) {
     mutate(
       Rank = if_else(.n > 1L, "Shootout", as.character(.start_pos))
     ) %>%
-    select(Rank, Player, Wins, Losses, `Win %`, dplyr::everything(), -`.win`, -`.tot`, -`.pos`, -`.start_pos`, -`.n`)
+    select(Rank, Player, Seed, Wins, Losses, `Win %`, dplyr::everything(), -`.win`, -`.tot`, -`.pos`, -`.start_pos`, -`.n`)
 }
 
 extract_sheet_id <- function(url_or_id) {
@@ -568,6 +686,12 @@ push_results_to_sheet <- function(results_tbl, sheet_id, sheet_name = "DDC Resul
   } else {
     paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
   }
+}
+
+push_result_tabs_to_sheet <- function(tabs, sheet_id) {
+  gs_auth()
+  purrr::iwalk(tabs, ~ sheet_write(.x, ss = sheet_id, sheet = .y))
+  paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
 }
 
 # ---------- UI ----------------------------------------------------------------
@@ -644,6 +768,7 @@ ui <- fluidPage(
       uiOutput("games_ui"),
       hr(),
       h4("Player Results"),
+      uiOutput("shootout_resolution_ui"),
       DTOutput("player_table")
     )
   )
@@ -653,6 +778,7 @@ ui <- fluidPage(
 
 server <- function(input, output, session) {
   session$allowReconnect(TRUE)  # allow automatic reconnect
+  schedule_version <- reactiveVal(0)
   
   players_vec <- reactive({
     req(input$players_raw)
@@ -662,6 +788,10 @@ server <- function(input, output, session) {
     shiny::validate(shiny::need(length(x) <= 11, "Please limit to 11 players for this version."))
     x
   })
+
+  observeEvent(input$make_schedule, {
+    schedule_version(schedule_version() + 1)
+  }, ignoreInit = TRUE, priority = 100)
   
   prelim_schedule <- eventReactive(input$make_schedule, {
     players <- players_vec()
@@ -677,14 +807,33 @@ server <- function(input, output, session) {
 
   prelim_scores_tbl <- reactive({
     req(prelim_schedule())
-    scores_for_games(prelim_schedule()$games, input)
+    scores_for_games(prelim_schedule()$games, input, schedule_version())
+  })
+
+  preliminary_results <- reactive({
+    req(prelim_schedule())
+    if ((input$format_mode %||% "single") != "two_group") return(NULL)
+    compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), NULL, prelim_scores_tbl())
+  })
+
+  prelim_shootout_groups <- reactive({
+    results <- preliminary_results()
+    if (is.null(results) || !games_complete(prelim_scores_tbl())) return(list())
+    find_shootout_groups(results)
+  })
+
+  resolved_preliminary_results <- reactive({
+    results <- preliminary_results()
+    if (is.null(results)) return(NULL)
+    apply_shootout_resolutions(results, prelim_shootout_groups(), input)
   })
 
   finals_schedule <- reactive({
     req(prelim_schedule())
     mode <- input$format_mode %||% "single"
     if (mode != "two_group") return(NULL)
-    make_two_group_finals_schedule(prelim_schedule(), prelim_scores_tbl())
+    if (length(unresolved_shootout_labels(prelim_shootout_groups(), input)) > 0) return(NULL)
+    make_two_group_finals_schedule(prelim_schedule(), prelim_scores_tbl(), resolved_preliminary_results())
   })
 
   schedule <- reactive({
@@ -703,7 +852,7 @@ server <- function(input, output, session) {
   # Collect scores directly from inputs (updates instantly as you type)
   scores_tbl <- reactive({
     req(schedule())
-    scores_for_games(schedule()$games, input)
+    scores_for_games(schedule()$games, input, schedule_version())
   })
   
   # AUTO-SAVE state to LocalStorage whenever players/scores/schedule change
@@ -738,20 +887,7 @@ server <- function(input, output, session) {
       updateRadioButtons(session, "format_mode", selected = dat$format_mode)
     }
     
-    # After schedule is generated, restore scores to inputs
-    observeEvent(schedule(), {
-      if (!is.null(dat$scores)) {
-        ids <- schedule()$games$game_id
-        for (i in seq_along(dat$scores$game_id)) {
-          gid <- dat$scores$game_id[i]
-          if (gid %in% ids) {
-            a <- dat$scores$scoreA[i]; b <- dat$scores$scoreB[i]
-            if (!is.na(a)) updateNumericInput(session, paste0("A_", gid), value = a)
-            if (!is.na(b)) updateNumericInput(session, paste0("B_", gid), value = b)
-          }
-        }
-      }
-    })
+    # Keep restored players/format only. Scores start blank on each generated schedule.
   }, ignoreInit = FALSE)
   
   # Build the schedule UI (with byes under Team B)
@@ -761,7 +897,7 @@ server <- function(input, output, session) {
     byes <- schedule()$byes  # tibble(round, byes) or NULL
     elems <- list()
     score_value <- function(prefix, gid) {
-      value <- input[[paste0(prefix, "_", gid)]]
+      value <- input[[score_input_id(prefix, gid, schedule_version())]]
       if (is.null(value)) NA else value
     }
 
@@ -804,10 +940,10 @@ server <- function(input, output, session) {
               column(
                 5,
                 div(class = "score-box small-input",
-                    numericInput(paste0("A_", gid), "A", value = score_value("A", gid), min = 0, step = 1)
+                    numericInput(score_input_id("A", gid, schedule_version()), "A", value = score_value("A", gid), min = 0, step = 1)
                 ),
                 div(class = "score-box small-input",
-                    numericInput(paste0("B_", gid), "B", value = score_value("B", gid), min = 0, step = 1)
+                    numericInput(score_input_id("B", gid, schedule_version()), "B", value = score_value("B", gid), min = 0, step = 1)
                 )
               )
             ),
@@ -827,14 +963,117 @@ server <- function(input, output, session) {
     compute_player_results(players_vec(), schedule()$games, scores_tbl())
   })
 
+  current_shootout_groups <- reactive({
+    req(player_results())
+    if ((input$format_mode %||% "single") == "two_group") {
+      prelim_groups <- prelim_shootout_groups()
+      if (length(unresolved_shootout_labels(prelim_groups, input)) > 0) return(prelim_groups)
+
+      finals <- finals_schedule()
+      if (is.null(finals)) return(list())
+      finals_scores <- scores_tbl() %>% semi_join(finals$games, by = "game_id")
+      if (!games_complete(finals_scores)) return(list())
+    } else if (!games_complete(scores_tbl())) {
+      return(list())
+    }
+
+    find_shootout_groups(player_results())
+  })
+
+  output$shootout_resolution_ui <- renderUI({
+    groups <- current_shootout_groups()
+    if (length(groups) == 0) return(NULL)
+
+    tagList(
+      div(
+        class = "well",
+        h4("Shootout Resolution"),
+        purrr::map(groups, function(group_info) {
+          players <- unlist(group_info$players)
+          seeds <- unlist(group_info$seeds)
+          players <- players[order(seeds)]
+          seeds <- sort(seeds)
+
+          if (length(players) == 3) {
+            top_seed <- players[1]
+            lower_seeds <- players[2:3]
+            first_winner <- input[[paste0(group_info$id, "_first_winner")]] %||% ""
+            final_choices <- if (nzchar(first_winner)) c(top_seed, first_winner) else top_seed
+
+            return(tagList(
+              tags$strong(group_info$label),
+              div(
+                class = "bye-line",
+                sprintf(
+                  "First shootout: %s vs %s. Winner advances to play %s.",
+                  lower_seeds[1],
+                  lower_seeds[2],
+                  top_seed
+                )
+              ),
+              fluidRow(
+                column(
+                  6,
+                  selectInput(
+                    paste0(group_info$id, "_first_winner"),
+                    "First shootout winner",
+                    choices = c("", lower_seeds),
+                    selected = first_winner
+                  )
+                ),
+                column(
+                  6,
+                  selectInput(
+                    paste0(group_info$id, "_final_winner"),
+                    "Second shootout winner",
+                    choices = c("", final_choices),
+                    selected = input[[paste0(group_info$id, "_final_winner")]] %||% ""
+                  )
+                )
+              )
+            ))
+          }
+
+          tagList(
+            tags$strong(group_info$label),
+            fluidRow(
+              column(
+                6,
+                selectInput(
+                  paste0(group_info$id, "_winner"),
+                  "Winner",
+                  choices = c("", players),
+                  selected = input[[paste0(group_info$id, "_winner")]] %||% ""
+                )
+              ),
+              column(
+                6,
+                selectInput(
+                  paste0(group_info$id, "_loser"),
+                  "Loser",
+                  choices = c("", players),
+                  selected = input[[paste0(group_info$id, "_loser")]] %||% ""
+                )
+              )
+            )
+          )
+        })
+      )
+    )
+  })
+
   output$player_table <- renderDT({
     req(player_results())
     tbl <- player_results()
+    hidden_targets <- which(names(tbl) == "Seed") - 1
     datatable(
       tbl,
       rownames = FALSE,
-      extensions = "Buttons",
-      options = list(dom = "Bfrtip", buttons = c("copy", "csv"), pageLength = 25)
+      options = list(
+        dom = "tip",
+        pageLength = 25,
+        columnDefs = list(list(visible = FALSE, targets = hidden_targets))
+      )
     ) %>%
       formatPercentage("Win %", digits = 1) %>%
       formatStyle(
@@ -853,10 +1092,41 @@ server <- function(input, output, session) {
   observeEvent(input$push_sheets, {
     sheet_push_status("Pushing results to Google Sheet...")
     result <- tryCatch({
-      tbl <- player_results()
+      shootout_groups <- current_shootout_groups()
+      unresolved <- unresolved_shootout_labels(shootout_groups, input)
+      if (length(unresolved) > 0) {
+        stop(
+          paste0(
+            "Resolve the shootout before pushing: ",
+            paste(unresolved, collapse = "; ")
+          ),
+          call. = FALSE
+        )
+      }
+
+      tbl <- apply_shootout_resolutions(player_results(), shootout_groups, input)
       req(nrow(tbl) > 0)
       ss_id <- extract_sheet_id(input$sheet_url)
-      sheet_url <- push_results_to_sheet(tbl, ss_id)
+      tabs <- list("DDC Results" = tbl)
+
+      if ((input$format_mode %||% "single") == "two_group") {
+        prelim_groups <- prelim_shootout_groups()
+        prelim_unresolved <- unresolved_shootout_labels(prelim_groups, input)
+        if (length(prelim_unresolved) > 0) {
+          stop(
+            paste0(
+              "Resolve the preliminary shootout before pushing: ",
+              paste(prelim_unresolved, collapse = "; ")
+            ),
+            call. = FALSE
+          )
+        }
+
+        prelim_tbl <- apply_shootout_resolutions(resolved_preliminary_results(), prelim_groups, input)
+        tabs[["Prelim Results"]] <- prelim_tbl
+      }
+
+      sheet_url <- push_result_tabs_to_sheet(tabs, ss_id)
       list(ok = TRUE, msg = paste0("Results pushed successfully.\n", sheet_url))
     }, error = function(e) {
       list(ok = FALSE, msg = paste0("Push failed: ", conditionMessage(e)))
