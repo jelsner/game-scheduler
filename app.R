@@ -33,6 +33,14 @@ google_service_account_email <- function() {
   "ddc-scheduler@game-scheduler-501709.iam.gserviceaccount.com"
 }
 
+short_player_name <- function(name) {
+  purrr::map_chr(name, function(x) {
+    parts <- str_split(str_squish(x), "\\s+")[[1]]
+    if (length(parts) < 2) return(parts[1])
+    paste(parts[1], paste0(str_sub(parts[2], 1, 1), "."))
+  })
+}
+
 # Keep player indices so we can derive byes automatically
 mk_games_df <- function(p, specs) {
   rounds <- purrr::map_int(specs, ~ as.integer(.x$round))
@@ -49,9 +57,11 @@ mk_games_df <- function(p, specs) {
   ) %>%
     mutate(
       teamA = purrr::map_chr(A_idx, ~ paste(p[.x], collapse = " / ")),
-      teamB = purrr::map_chr(B_idx, ~ paste(p[.x], collapse = " / "))
+      teamB = purrr::map_chr(B_idx, ~ paste(p[.x], collapse = " / ")),
+      teamA_display = purrr::map_chr(A_idx, ~ paste(short_player_name(p[.x]), collapse = " / ")),
+      teamB_display = purrr::map_chr(B_idx, ~ paste(short_player_name(p[.x]), collapse = " / "))
     ) %>%
-    select(game_id, round, court, A_idx, B_idx, teamA, teamB)
+    select(game_id, round, court, A_idx, B_idx, teamA, teamB, teamA_display, teamB_display)
 }
 
 # Derive byes per round from which players appear in games that round
@@ -64,7 +74,7 @@ compute_byes_from_games <- function(p, games_df) {
     tibble(
       round = r,
       byes  = if (length(bye_idx) == 0) NA_character_
-      else paste(p[bye_idx], collapse = ", ")
+      else paste(short_player_name(p[bye_idx]), collapse = ", ")
     )
   }) %>% dplyr::filter(!is.na(byes))
   if (nrow(out) == 0) return(NULL)
@@ -594,6 +604,7 @@ compute_player_results <- function(players, schedule_games, scores_tbl) {
     left_join(records, by = c("Player" = "player")) %>%
     left_join(round_wide, by = c("Player" = "player")) %>%
     mutate(
+      Player = short_player_name(Player),
       Wins = replace_na(Wins, 0L),
       Losses = replace_na(Losses, 0L)
     ) %>%
@@ -813,6 +824,7 @@ ui <- fluidPage(
         selected = "single"
       ),
       actionButton("make_schedule", "Generate Schedule", class = "btn-primary"),
+      uiOutput("finals_controls"),
       br(), br(),
       hr(),
       h4("Scorekeeper"),
@@ -861,6 +873,7 @@ server <- function(input, output, session) {
   session$allowReconnect(TRUE)  # allow automatic reconnect
   schedule_version <- reactiveVal(0)
   admin_unlocked <- reactiveVal(FALSE)
+  finals_schedule_value <- reactiveVal(NULL)
 
   observe({
     controls <- c("push_sheets")
@@ -905,6 +918,7 @@ server <- function(input, output, session) {
 
   observeEvent(input$make_schedule, {
     schedule_version(schedule_version() + 1)
+    finals_schedule_value(NULL)
   }, ignoreInit = TRUE, priority = 100)
   
   prelim_schedule <- eventReactive(input$make_schedule, {
@@ -942,17 +956,9 @@ server <- function(input, output, session) {
     apply_shootout_resolutions(results, prelim_shootout_groups(), input)
   })
 
-  finals_schedule <- reactive({
-    req(prelim_schedule())
-    mode <- input$format_mode %||% "single"
-    if (mode != "two_group") return(NULL)
-    if (length(unresolved_shootout_labels(prelim_shootout_groups(), input)) > 0) return(NULL)
-    make_two_group_finals_schedule(prelim_schedule(), prelim_scores_tbl(), resolved_preliminary_results())
-  })
-
   schedule <- reactive({
     req(prelim_schedule())
-    finals <- finals_schedule()
+    finals <- finals_schedule_value()
     if (is.null(finals)) return(prelim_schedule())
 
     list(
@@ -968,6 +974,39 @@ server <- function(input, output, session) {
     req(schedule())
     scores_for_games(schedule()$games, input, schedule_version())
   })
+
+  output$finals_controls <- renderUI({
+    if (!admin_unlocked() || (input$format_mode %||% "single") != "two_group") return(NULL)
+    if (is.null(prelim_schedule())) return(NULL)
+    if (!games_complete(prelim_scores_tbl())) {
+      return(tags$p(class = "text-muted", "Finish preliminary scores before generating finals."))
+    }
+    unresolved <- unresolved_shootout_labels(prelim_shootout_groups(), input)
+    if (length(unresolved) > 0) {
+      return(tags$p(class = "text-warning", "Resolve preliminary shootouts before generating finals."))
+    }
+    if (!is.null(finals_schedule_value())) {
+      return(tags$p(class = "text-success", "Finals schedule generated."))
+    }
+    tagList(
+      br(),
+      actionButton("generate_finals", "Generate Finals", class = "btn-info")
+    )
+  })
+
+  observeEvent(input$generate_finals, {
+    req(admin_unlocked())
+    req((input$format_mode %||% "single") == "two_group")
+    req(games_complete(prelim_scores_tbl()))
+    req(length(unresolved_shootout_labels(prelim_shootout_groups(), input)) == 0)
+    finals_schedule_value(
+      make_two_group_finals_schedule(
+        prelim_schedule(),
+        prelim_scores_tbl(),
+        resolved_preliminary_results()
+      )
+    )
+  }, ignoreInit = TRUE)
   
   # AUTO-SAVE state to LocalStorage whenever players/scores/schedule change
   observe({
@@ -1011,7 +1050,7 @@ server <- function(input, output, session) {
     byes <- schedule()$byes  # tibble(round, byes) or NULL
     elems <- list()
     score_value <- function(prefix, gid) {
-      value <- input[[score_input_id(prefix, gid, schedule_version())]]
+      value <- isolate(input[[score_input_id(prefix, gid, schedule_version())]])
       if (is.null(value)) NA else value
     }
     score_input <- function(prefix, gid) {
@@ -1071,8 +1110,8 @@ server <- function(input, output, session) {
               column(
                 if (admin_unlocked()) 7 else 12,
                 strong(sprintf("Game %d (Court %d):", gid, sub$court[i])),
-                div(sprintf("Team A: %s", sub$teamA[i])),
-                div(sprintf("Team B: %s", sub$teamB[i])),
+                div(sprintf("Team A: %s", sub$teamA_display[i])),
+                div(sprintf("Team B: %s", sub$teamB_display[i])),
                 if (!is.null(round_byes)) div(class="bye-line", round_byes)
               ),
               score_column
@@ -1088,7 +1127,7 @@ server <- function(input, output, session) {
   player_results <- reactive({
     req(schedule())
     if ((input$format_mode %||% "single") == "two_group") {
-      return(compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), finals_schedule(), scores_tbl()))
+      return(compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), finals_schedule_value(), scores_tbl()))
     }
     compute_player_results(players_vec(), schedule()$games, scores_tbl())
   })
@@ -1099,7 +1138,7 @@ server <- function(input, output, session) {
       prelim_groups <- prelim_shootout_groups()
       if (length(unresolved_shootout_labels(prelim_groups, input)) > 0) return(prelim_groups)
 
-      finals <- finals_schedule()
+      finals <- finals_schedule_value()
       if (is.null(finals)) return(list())
       finals_scores <- scores_tbl() %>% semi_join(finals$games, by = "game_id")
       if (!games_complete(finals_scores)) return(list())
