@@ -59,9 +59,10 @@ mk_games_df <- function(p, specs) {
       teamA = purrr::map_chr(A_idx, ~ paste(p[.x], collapse = " / ")),
       teamB = purrr::map_chr(B_idx, ~ paste(p[.x], collapse = " / ")),
       teamA_display = purrr::map_chr(A_idx, ~ paste(short_player_name(p[.x]), collapse = " / ")),
-      teamB_display = purrr::map_chr(B_idx, ~ paste(short_player_name(p[.x]), collapse = " / "))
+      teamB_display = purrr::map_chr(B_idx, ~ paste(short_player_name(p[.x]), collapse = " / ")),
+      count_in_standings = TRUE
     ) %>%
-    select(game_id, round, court, A_idx, B_idx, teamA, teamB, teamA_display, teamB_display)
+    select(game_id, round, court, A_idx, B_idx, teamA, teamB, teamA_display, teamB_display, count_in_standings)
 }
 
 # Derive byes per round from which players appear in games that round
@@ -235,7 +236,8 @@ add_schedule_context <- function(schedule, phase, group, game_offset = 0, court_
       game_id = game_id + game_offset,
       court = court + court_offset,
       phase = phase,
-      group = group
+      group = group,
+      count_in_standings = count_in_standings %||% TRUE
     ) %>%
     select(game_id, phase, group, round, court, dplyr::everything())
 
@@ -247,6 +249,23 @@ add_schedule_context <- function(schedule, phase, group, game_offset = 0, court_
   }
 
   list(games = games, byes = byes)
+}
+
+make_manual_game <- function(game_id, round_number, team_a, team_b, count_in_standings) {
+  tibble(
+    game_id = game_id,
+    phase = "Manual",
+    group = "Extra Games",
+    round = round_number,
+    court = 1L,
+    A_idx = I(list(integer())),
+    B_idx = I(list(integer())),
+    teamA = paste(team_a, collapse = " / "),
+    teamB = paste(team_b, collapse = " / "),
+    teamA_display = paste(short_player_name(team_a), collapse = " / "),
+    teamB_display = paste(short_player_name(team_b), collapse = " / "),
+    count_in_standings = count_in_standings
+  )
 }
 
 bind_byes <- function(...) {
@@ -322,6 +341,12 @@ scores_for_games <- function(games, input, version) {
 
 games_complete <- function(scores_tbl) {
   nrow(scores_tbl) > 0 && all(!is.na(scores_tbl$scoreA) & !is.na(scores_tbl$scoreB))
+}
+
+players_in_games <- function(games, preferred_order = character()) {
+  game_players <- unique(unlist(str_split(c(games$teamA, games$teamB), " / ")))
+  game_players <- game_players[nzchar(game_players)]
+  c(preferred_order[preferred_order %in% game_players], setdiff(game_players, preferred_order))
 }
 
 ranked_players_for_group <- function(players, games, scores_tbl) {
@@ -831,6 +856,7 @@ ui <- fluidPage(
       passwordInput("admin_password", "Admin password"),
       actionButton("unlock_admin", "Unlock scorekeeping", class = "btn-warning"),
       uiOutput("admin_status"),
+      uiOutput("manual_game_ui"),
       hr(),
       h4("Google Sheet"),
       textInput(
@@ -874,6 +900,7 @@ server <- function(input, output, session) {
   schedule_version <- reactiveVal(0)
   admin_unlocked <- reactiveVal(FALSE)
   finals_schedule_value <- reactiveVal(NULL)
+  manual_games <- reactiveVal(tibble())
 
   observe({
     controls <- c("push_sheets")
@@ -919,6 +946,7 @@ server <- function(input, output, session) {
   observeEvent(input$make_schedule, {
     schedule_version(schedule_version() + 1)
     finals_schedule_value(NULL)
+    manual_games(tibble())
   }, ignoreInit = TRUE, priority = 100)
   
   prelim_schedule <- eventReactive(input$make_schedule, {
@@ -959,12 +987,22 @@ server <- function(input, output, session) {
   schedule <- reactive({
     req(prelim_schedule())
     finals <- finals_schedule_value()
-    if (is.null(finals)) return(prelim_schedule())
+    games <- prelim_schedule()$games
+    byes <- prelim_schedule()$byes
+
+    if (!is.null(finals)) {
+      games <- bind_rows(games, finals$games)
+      byes <- bind_byes(byes, finals$byes)
+    }
+
+    if (nrow(manual_games()) > 0) {
+      games <- bind_rows(games, manual_games())
+    }
 
     list(
-      games = bind_rows(prelim_schedule()$games, finals$games) %>%
-        arrange(factor(phase, levels = c("Main", "Preliminary", "Finals")), group, round, court, game_id),
-      byes = bind_byes(prelim_schedule()$byes, finals$byes),
+      games = games %>%
+        arrange(factor(phase, levels = c("Main", "Preliminary", "Finals", "Manual")), group, round, court, game_id),
+      byes = byes,
       groups = prelim_schedule()$groups
     )
   })
@@ -1006,6 +1044,51 @@ server <- function(input, output, session) {
         resolved_preliminary_results()
       )
     )
+  }, ignoreInit = TRUE)
+
+  output$manual_game_ui <- renderUI({
+    if (!admin_unlocked() || is.null(prelim_schedule())) return(NULL)
+    player_choices <- players_vec()
+
+    tagList(
+      hr(),
+      h4("Add Game"),
+      selectInput("manual_a1", "Team A player 1", choices = c("", player_choices)),
+      selectInput("manual_a2", "Team A player 2", choices = c("", player_choices)),
+      selectInput("manual_b1", "Team B player 1", choices = c("", player_choices)),
+      selectInput("manual_b2", "Team B player 2", choices = c("", player_choices)),
+      checkboxInput("manual_counts", "Counts in standings", value = TRUE),
+      actionButton("add_manual_game", "Add Game", class = "btn-info")
+    )
+  })
+
+  observeEvent(input$add_manual_game, {
+    req(admin_unlocked())
+    req(schedule())
+
+    selected <- c(input$manual_a1, input$manual_a2, input$manual_b1, input$manual_b2)
+    selected <- selected[nzchar(selected)]
+    if (length(selected) != 4 || length(unique(selected)) != 4) {
+      showNotification("Select four distinct players for the added game.", type = "error", duration = 6)
+      return()
+    }
+
+    existing_ids <- c(schedule()$games$game_id, manual_games()$game_id)
+    next_id <- if (length(existing_ids) == 0) 1L else max(existing_ids, na.rm = TRUE) + 1L
+    next_round <- max(schedule()$games$round, na.rm = TRUE) + 1L
+
+    manual_games(bind_rows(
+      manual_games(),
+      make_manual_game(
+        game_id = next_id,
+        round_number = next_round,
+        team_a = selected[1:2],
+        team_b = selected[3:4],
+        count_in_standings = isTRUE(input$manual_counts)
+      )
+    ))
+
+    showNotification("Added manual game.", type = "message", duration = 4)
   }, ignoreInit = TRUE)
   
   # AUTO-SAVE state to LocalStorage whenever players/scores/schedule change
@@ -1112,6 +1195,7 @@ server <- function(input, output, session) {
                 strong(sprintf("Game %d (Court %d):", gid, sub$court[i])),
                 div(sprintf("Team A: %s", sub$teamA_display[i])),
                 div(sprintf("Team B: %s", sub$teamB_display[i])),
+                if (!isTRUE(sub$count_in_standings[i])) div(class="bye-line", "Does not count in standings"),
                 if (!is.null(round_byes)) div(class="bye-line", round_byes)
               ),
               score_column
@@ -1129,7 +1213,9 @@ server <- function(input, output, session) {
     if ((input$format_mode %||% "single") == "two_group") {
       return(compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), finals_schedule_value(), scores_tbl()))
     }
-    compute_player_results(players_vec(), schedule()$games, scores_tbl())
+    counted_games <- schedule()$games %>% filter(count_in_standings)
+    counted_scores <- scores_tbl() %>% semi_join(counted_games, by = "game_id")
+    compute_player_results(players_in_games(counted_games, players_vec()), counted_games, counted_scores)
   })
 
   current_shootout_groups <- reactive({
