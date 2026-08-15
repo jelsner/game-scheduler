@@ -837,6 +837,9 @@ ui <- fluidPage(
     .score-box { display: inline-block; margin-right: 8px; }
     .round-header { background:#f6f6f6; padding:6px 10px; margin-top:10px; border-radius:6px; }
     .bye-line { font-style: italic; margin-left:0; margin-top:4px; }
+    .btn-muted-red { background:#b85c5c; border-color:#a24f4f; color:#fff; }
+    .btn-muted-red:hover, .btn-muted-red:focus { background:#a24f4f; border-color:#8f4545; color:#fff; }
+    .btn-muted-red[disabled] { background:#c98a8a; border-color:#bb7777; color:#fff; opacity:0.65; }
   "))),
   # JS: heartbeat + LocalStorage save/restore
   tags$script(HTML("
@@ -965,7 +968,7 @@ server <- function(input, output, session) {
     sheet_url <- tryCatch(google_sheet_url(input$sheet_url), error = function(e) NULL)
     if (is.null(sheet_url)) {
       return(tagList(
-        tags$button("Check Results", class = "btn btn-default", disabled = NA),
+        tags$button("Check Results", class = "btn btn-muted-red", disabled = NA),
         helpText("Configure a Google Sheet to share results.")
       ))
     }
@@ -976,7 +979,7 @@ server <- function(input, output, session) {
         href = sheet_url,
         target = "_blank",
         rel = "noopener noreferrer",
-        class = "btn btn-default",
+        class = "btn btn-muted-red",
         role = "button"
       ),
       helpText("Opens the shared results sheet in a separate browser tab.")
