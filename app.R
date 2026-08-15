@@ -695,6 +695,11 @@ extract_sheet_id <- function(url_or_id) {
   stop("Could not parse a Google Sheet ID from that URL.")
 }
 
+google_sheet_url <- function(url_or_id) {
+  sheet_id <- extract_sheet_id(url_or_id)
+  paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
+}
+
 gs_auth <- function() {
   sa <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
   if (!nzchar(sa)) {
@@ -885,6 +890,7 @@ ui <- fluidPage(
         placeholder = "https://docs.google.com/spreadsheets/d/...",
         width = "100%"
       ),
+      uiOutput("check_results_ui"),
       actionButton("push_sheets", "Push Results to Google Sheet", class = "btn-success"),
       helpText(
         tags$strong("To push to your own Google Sheet:"),
@@ -953,6 +959,28 @@ server <- function(input, output, session) {
     } else {
       tags$p(class = "text-muted", "Schedule setup is open. Scorekeeping is locked.")
     }
+  })
+
+  output$check_results_ui <- renderUI({
+    sheet_url <- tryCatch(google_sheet_url(input$sheet_url), error = function(e) NULL)
+    if (is.null(sheet_url)) {
+      return(tagList(
+        tags$button("Check Results", class = "btn btn-default", disabled = NA),
+        helpText("Configure a Google Sheet to share results.")
+      ))
+    }
+
+    tagList(
+      tags$a(
+        "Check Results",
+        href = sheet_url,
+        target = "_blank",
+        rel = "noopener noreferrer",
+        class = "btn btn-default",
+        role = "button"
+      ),
+      helpText("Opens the shared results sheet in a separate browser tab.")
+    )
   })
   
   players_vec <- reactive({
