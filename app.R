@@ -883,7 +883,7 @@ ui <- fluidPage(
       actionButton("unlock_admin", "Unlock scorekeeping", class = "btn-warning"),
       uiOutput("admin_status"),
       hr(),
-      h4("Google Sheet"),
+      h4("Results"),
       textInput(
         "sheet_url",
         "Sheet URL or ID",
@@ -891,7 +891,7 @@ ui <- fluidPage(
         width = "100%"
       ),
       uiOutput("check_results_ui"),
-      actionButton("push_sheets", "Push Results to Google Sheet", class = "btn-success"),
+      actionButton("push_sheets", "Push Results", class = "btn-success"),
       helpText(
         tags$strong("To push to your own Google Sheet:"),
         tags$ol(
