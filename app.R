@@ -700,6 +700,118 @@ google_sheet_url <- function(url_or_id) {
   paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
 }
 
+season_raw_columns <- c("League Date", "Player", "Win", "Losses", "Games", "W-L %", "PD")
+
+empty_season_raw_results <- function() {
+  tibble(
+    `League Date` = as.Date(character()),
+    Player = character(),
+    Win = integer(),
+    Losses = integer(),
+    Games = integer(),
+    `W-L %` = numeric(),
+    PD = numeric()
+  )
+}
+
+daily_results_for_season <- function(results_tbl, league_date) {
+  results_tbl %>%
+    transmute(
+      `League Date` = as.Date(league_date),
+      Player,
+      Win = Wins,
+      Losses,
+      Games = Wins + Losses,
+      `W-L %` = `Win %`,
+      PD = Total
+    )
+}
+
+read_season_raw_results <- function(sheet_id, sheet_name = "Season Raw Results") {
+  existing <- tryCatch(
+    read_sheet(ss = sheet_id, sheet = sheet_name, col_types = "c"),
+    error = function(e) empty_season_raw_results()
+  )
+
+  if (nrow(existing) == 0) return(empty_season_raw_results())
+
+  for (col in setdiff(season_raw_columns, names(existing))) {
+    existing[[col]] <- NA
+  }
+
+  existing %>%
+    select(any_of(season_raw_columns)) %>%
+    mutate(
+      `League Date` = as.Date(`League Date`),
+      Win = as.integer(Win),
+      Losses = as.integer(Losses),
+      Games = as.integer(Games),
+      `W-L %` = as.numeric(`W-L %`),
+      PD = as.numeric(PD)
+    )
+}
+
+update_season_raw_results <- function(existing_raw, daily_raw, league_date) {
+  bind_rows(
+    existing_raw %>% filter(as.Date(`League Date`) != as.Date(league_date)),
+    daily_raw
+  ) %>%
+    arrange(`League Date`, Player)
+}
+
+compute_season_standings <- function(season_raw) {
+  if (nrow(season_raw) == 0) {
+    return(tibble(
+      Player = character(),
+      Win = integer(),
+      Losses = integer(),
+      Games = integer(),
+      `W-L %` = numeric(),
+      `Rank 1` = integer(),
+      PD = numeric(),
+      `PD/Game` = numeric(),
+      `Rank 2` = integer(),
+      `Avg Rank` = numeric()
+    ))
+  }
+
+  season_raw %>%
+    group_by(Player) %>%
+    summarise(
+      Win = sum(Win, na.rm = TRUE),
+      Losses = sum(Losses, na.rm = TRUE),
+      Games = sum(Games, na.rm = TRUE),
+      PD = sum(PD, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      `W-L %` = if_else(Games > 0, Win / Games, NA_real_),
+      `PD/Game` = if_else(Games > 0, PD / Games, NA_real_),
+      `Rank 1` = min_rank(desc(`W-L %`)),
+      `Rank 2` = min_rank(desc(`PD/Game`)),
+      `Avg Rank` = (`Rank 1` + `Rank 2`) / 2
+    ) %>%
+    select(Player, Win, Losses, Games, `W-L %`, `Rank 1`, PD, `PD/Game`, `Rank 2`, `Avg Rank`) %>%
+    arrange(`Avg Rank`, `Rank 1`, `Rank 2`, desc(`W-L %`), desc(`PD/Game`), Player)
+}
+
+read_players_from_season_standings <- function(sheet_id, sheet_name = "Season Standings") {
+  standings <- read_sheet(ss = sheet_id, sheet = sheet_name, col_types = "c")
+  if (!"Player" %in% names(standings)) {
+    stop("Season Standings does not include a Player column.", call. = FALSE)
+  }
+
+  players <- standings$Player %>%
+    str_trim()
+  players <- players[nzchar(players)]
+
+  if (length(players) == 0) {
+    stop("Season Standings has no players yet.", call. = FALSE)
+  }
+
+  players
+}
+
 gs_auth <- function() {
   sa <- Sys.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
   if (!nzchar(sa)) {
@@ -747,11 +859,13 @@ push_results_to_sheet <- function(results_tbl, sheet_id, sheet_name = "DDC Resul
   }
 }
 
-push_result_tabs_to_sheet <- function(tabs, sheet_id) {
+push_result_tabs_to_sheet <- function(tabs, sheet_id, format_sheets = names(tabs)) {
   gs_auth()
   purrr::iwalk(tabs, function(tbl, sheet_name) {
     sheet_write(tbl, ss = sheet_id, sheet = sheet_name)
-    format_results_sheet(sheet_id, sheet_name, tbl)
+    if (sheet_name %in% format_sheets) {
+      format_results_sheet(sheet_id, sheet_name, tbl)
+    }
   })
   paste0("https://docs.google.com/spreadsheets/d/", sheet_id, "/edit")
 }
@@ -804,17 +918,27 @@ format_results_sheet <- function(sheet_id, sheet_name, results_tbl) {
     )
   }
 
-  if ("Win %" %in% names(results_tbl)) {
+  percent_cols <- intersect(c("Win %", "W-L %"), names(results_tbl))
+  for (col in percent_cols) {
     apply_format(
-      col_range("Win %"),
+      col_range(col),
       horizontalAlignment = "CENTER",
       numberFormat = list(type = "PERCENT", pattern = "0.00%")
     )
   }
 
+  decimal_cols <- intersect(c("PD/Game", "Avg Rank"), names(results_tbl))
+  for (col in decimal_cols) {
+    apply_format(
+      col_range(col),
+      horizontalAlignment = "CENTER",
+      numberFormat = list(type = "NUMBER", pattern = "0.00")
+    )
+  }
+
   numeric_cols <- setdiff(
     names(results_tbl)[vapply(results_tbl, is.numeric, logical(1))],
-    "Win %"
+    c(percent_cols, decimal_cols)
   )
   for (col in numeric_cols) {
     apply_format(
@@ -868,6 +992,8 @@ ui <- fluidPage(
       h4("Enter players in seeded order (one per line)"),
       textAreaInput("players_raw", NULL,
                     placeholder = "Jim\nHank\nScott\nDrew\n…", rows = 10),
+      actionButton("load_standings_players", "Load From Standings", class = "btn-default"),
+      helpText("Loads current season order into the editable player list."),
       radioButtons(
         "format_mode",
         "Format",
@@ -885,16 +1011,13 @@ ui <- fluidPage(
       passwordInput("admin_password", "Admin password"),
       actionButton("unlock_admin", "Unlock scorekeeping", class = "btn-warning"),
       uiOutput("admin_status"),
+      uiOutput("manual_game_button_ui"),
       hr(),
       h4("Results"),
-      textInput(
-        "sheet_url",
-        "Sheet URL or ID",
-        placeholder = "https://docs.google.com/spreadsheets/d/...",
-        width = "100%"
-      ),
+      dateInput("league_date", "League date", value = Sys.Date()),
       uiOutput("check_results_ui"),
       actionButton("push_sheets", "Push Results", class = "btn-success"),
+      actionButton("finalize_day", "Finalize Day", class = "btn-primary"),
       helpText(
         tags$strong("To push to your own Google Sheet:"),
         tags$ol(
@@ -904,17 +1027,27 @@ ui <- fluidPage(
             tags$code(google_service_account_email()),
             " as Editor (you can uncheck \"Notify people\")."
           ),
-          tags$li("Click ", tags$strong("Push Results to Google Sheet"), ".")
-        ),
+          tags$li("Click ", tags$strong("Push Results"), " during play to update the daily results."),
+          tags$li("Click ", tags$strong("Finalize Day"), " after the final scores are complete to update season standings.")
+        )
+      ),
+      textInput(
+        "sheet_url",
+        "Sheet URL or ID",
+        placeholder = "https://docs.google.com/spreadsheets/d/...",
+        width = "100%"
+      ),
+      helpText(
         "Leave the URL blank to use the default sheet. ",
-        "Results are written to the ", tags$strong("DDC Results"), " tab."
+        "Live results are written to ", tags$strong("DDC Results"), ". Finalized results also update ",
+        tags$strong("Season Raw Results"), " and ", tags$strong("Season Standings"), "."
       ),
       verbatimTextOutput("sheet_push_status")
     ),
     mainPanel(
       h4("Schedule, Courts, Byes, & Scoring"),
-      uiOutput("manual_game_ui"),
       uiOutput("games_ui"),
+      uiOutput("manual_game_ui"),
       hr(),
       h4("Player Results"),
       uiOutput("shootout_resolution_ui"),
@@ -931,9 +1064,10 @@ server <- function(input, output, session) {
   admin_unlocked <- reactiveVal(FALSE)
   finals_schedule_value <- reactiveVal(NULL)
   manual_games <- reactiveVal(empty_manual_games())
+  manual_game_active <- reactiveVal(FALSE)
 
   observe({
-    controls <- c("push_sheets")
+    controls <- c("push_sheets", "finalize_day")
     purrr::walk(controls, ~ {
       if (admin_unlocked()) shinyjs::enable(.x) else shinyjs::disable(.x)
     })
@@ -985,6 +1119,24 @@ server <- function(input, output, session) {
       helpText("Opens the shared results sheet in a separate browser tab.")
     )
   })
+
+  observeEvent(input$load_standings_players, {
+    result <- tryCatch({
+      ss_id <- extract_sheet_id(input$sheet_url)
+      gs_auth()
+      players <- read_players_from_season_standings(ss_id)
+      updateTextAreaInput(session, "players_raw", value = paste(players, collapse = "\n"))
+      list(ok = TRUE, msg = "Loaded players from Season Standings.")
+    }, error = function(e) {
+      list(ok = FALSE, msg = paste0("Could not load players from Season Standings. Enter the opening order manually, or finalize a league day first. Details: ", conditionMessage(e)))
+    })
+
+    if (result$ok) {
+      showNotification(result$msg, type = "message", duration = 5)
+    } else {
+      showNotification(result$msg, type = "warning", duration = 10)
+    }
+  }, ignoreInit = TRUE)
   
   players_vec <- reactive({
     req(input$players_raw)
@@ -999,6 +1151,7 @@ server <- function(input, output, session) {
     schedule_version(schedule_version() + 1)
     finals_schedule_value(NULL)
     manual_games(empty_manual_games())
+    manual_game_active(FALSE)
   }, ignoreInit = TRUE, priority = 100)
   
   prelim_schedule <- eventReactive(input$make_schedule, {
@@ -1098,25 +1251,46 @@ server <- function(input, output, session) {
     )
   }, ignoreInit = TRUE)
 
+  output$manual_game_button_ui <- renderUI({
+    if (!admin_unlocked() || is.null(prelim_schedule())) return(NULL)
+
+    tagList(
+      br(),
+      actionButton("open_manual_game", "Add Game", class = "btn-info")
+    )
+  })
+
+  observeEvent(input$open_manual_game, {
+    req(admin_unlocked())
+    req(prelim_schedule())
+    manual_game_active(TRUE)
+  }, ignoreInit = TRUE)
+
   output$manual_game_ui <- renderUI({
     if (!admin_unlocked() || is.null(prelim_schedule())) return(NULL)
     player_choices <- players_vec()
+    input_enabled <- isTRUE(manual_game_active())
+    maybe_disabled <- function(input_control) {
+      if (input_enabled) input_control else shinyjs::disabled(input_control)
+    }
 
     tagList(
       hr(),
       h4("Add Game"),
-      selectInput("manual_a1", "Team A player 1", choices = c("", player_choices)),
-      selectInput("manual_a2", "Team A player 2", choices = c("", player_choices)),
-      selectInput("manual_b1", "Team B player 1", choices = c("", player_choices)),
-      selectInput("manual_b2", "Team B player 2", choices = c("", player_choices)),
-      checkboxInput("manual_counts", "Counts in standings", value = TRUE),
-      actionButton("add_manual_game", "Add Game", class = "btn-info")
+      if (!input_enabled) tags$p(class = "text-muted", "Select Add Game in the left panel to choose players."),
+      maybe_disabled(selectInput("manual_a1", "Team A player 1", choices = c("", player_choices))),
+      maybe_disabled(selectInput("manual_a2", "Team A player 2", choices = c("", player_choices))),
+      maybe_disabled(selectInput("manual_b1", "Team B player 1", choices = c("", player_choices))),
+      maybe_disabled(selectInput("manual_b2", "Team B player 2", choices = c("", player_choices))),
+      maybe_disabled(checkboxInput("manual_counts", "Counts in standings", value = TRUE)),
+      maybe_disabled(actionButton("add_manual_game", "Add Selected Game", class = "btn-info"))
     )
   })
 
   observeEvent(input$add_manual_game, {
     req(admin_unlocked())
     req(schedule())
+    req(manual_game_active())
 
     selected <- c(input$manual_a1, input$manual_a2, input$manual_b1, input$manual_b2)
     selected <- selected[nzchar(selected)]
@@ -1141,6 +1315,7 @@ server <- function(input, output, session) {
     ))
 
     showNotification("Added manual game.", type = "message", duration = 4)
+    manual_game_active(FALSE)
   }, ignoreInit = TRUE)
   
   # AUTO-SAVE state to LocalStorage whenever players/scores/schedule change
@@ -1397,10 +1572,7 @@ server <- function(input, output, session) {
 
   sheet_push_status <- reactiveVal("")
 
-  observeEvent(input$push_sheets, {
-    req(admin_unlocked())
-    sheet_push_status("Pushing results to Google Sheet...")
-    result <- tryCatch({
+  build_result_tabs <- function(include_season = FALSE) {
       shootout_groups <- current_shootout_groups()
       unresolved <- unresolved_shootout_labels(shootout_groups, input)
       if (length(unresolved) > 0) {
@@ -1416,9 +1588,9 @@ server <- function(input, output, session) {
       tbl <- apply_shootout_resolutions(player_results(), shootout_groups, input)
       req(nrow(tbl) > 0)
       ss_id <- extract_sheet_id(input$sheet_url)
-      tabs <- list("DDC Results" = tbl)
+      tabs <- if (include_season) list() else list("DDC Results" = tbl)
 
-      if ((input$format_mode %||% "single") == "two_group") {
+      if (!include_season && (input$format_mode %||% "single") == "two_group") {
         prelim_groups <- prelim_shootout_groups()
         prelim_unresolved <- unresolved_shootout_labels(prelim_groups, input)
         if (length(prelim_unresolved) > 0) {
@@ -1435,14 +1607,71 @@ server <- function(input, output, session) {
         tabs[["Prelim Results"]] <- prelim_tbl
       }
 
-      sheet_url <- push_result_tabs_to_sheet(tabs, ss_id)
-      list(ok = TRUE, msg = paste0("Results pushed successfully.\n", sheet_url))
+      if (include_season) {
+        if (!games_complete(scores_tbl())) {
+          stop("Finish all scores before finalizing the day.", call. = FALSE)
+        }
+        if ((input$format_mode %||% "single") == "two_group" && is.null(finals_schedule_value())) {
+          stop("Generate finals before finalizing a two-group day.", call. = FALSE)
+        }
+        league_date <- input$league_date %||% Sys.Date()
+        gs_auth()
+        daily_raw <- daily_results_for_season(tbl, league_date)
+        season_raw <- update_season_raw_results(
+          read_season_raw_results(ss_id),
+          daily_raw,
+          league_date
+        )
+        tabs[["Season Raw Results"]] <- season_raw
+        tabs[["Season Standings"]] <- compute_season_standings(season_raw)
+      }
+
+      list(sheet_id = ss_id, tabs = tabs)
+  }
+
+  push_tabs <- function(include_season = FALSE) {
+    built <- build_result_tabs(include_season = include_season)
+    format_sheets <- if (include_season) character(0) else "DDC Results"
+    sheet_url <- push_result_tabs_to_sheet(
+      built$tabs,
+      built$sheet_id,
+      format_sheets = format_sheets
+    )
+    if (include_season) {
+      paste0("Day finalized and season standings updated.\n", sheet_url)
+    } else {
+      paste0("Results pushed successfully.\n", sheet_url)
+    }
+  }
+
+  observeEvent(input$push_sheets, {
+    req(admin_unlocked())
+    sheet_push_status("Pushing results...")
+    result <- tryCatch({
+      list(ok = TRUE, msg = push_tabs(include_season = FALSE))
     }, error = function(e) {
       list(ok = FALSE, msg = paste0("Push failed: ", conditionMessage(e)))
     })
 
     if (result$ok) {
       showNotification("Results pushed to Google Sheet.", type = "message", duration = 5)
+    } else {
+      showNotification(result$msg, type = "error", duration = 8)
+    }
+    sheet_push_status(result$msg)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$finalize_day, {
+    req(admin_unlocked())
+    sheet_push_status("Finalizing day and updating season standings...")
+    result <- tryCatch({
+      list(ok = TRUE, msg = push_tabs(include_season = TRUE))
+    }, error = function(e) {
+      list(ok = FALSE, msg = paste0("Finalize failed: ", conditionMessage(e)))
+    })
+
+    if (result$ok) {
+      showNotification("Day finalized and season standings updated.", type = "message", duration = 5)
     } else {
       showNotification(result$msg, type = "error", duration = 8)
     }
