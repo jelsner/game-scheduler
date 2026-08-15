@@ -268,6 +268,23 @@ make_manual_game <- function(game_id, round_number, team_a, team_b, count_in_sta
   )
 }
 
+empty_manual_games <- function() {
+  tibble(
+    game_id = integer(),
+    phase = character(),
+    group = character(),
+    round = integer(),
+    court = integer(),
+    A_idx = I(list()),
+    B_idx = I(list()),
+    teamA = character(),
+    teamB = character(),
+    teamA_display = character(),
+    teamB_display = character(),
+    count_in_standings = logical()
+  )
+}
+
 bind_byes <- function(...) {
   byes <- bind_rows(...)
   if (nrow(byes) == 0 || !all(c("phase", "group", "round", "byes") %in% names(byes))) {
@@ -833,6 +850,10 @@ ui <- fluidPage(
     });
   ")),
   titlePanel("DDC / Escape!! - Ranked Pairings & Scores (4-11 players)"),
+  tags$p(
+    class = "text-muted",
+    "Ranked Pairings are based on the Kodiak system developed by Cade Loving."
+  ),
   
   sidebarLayout(
     sidebarPanel(
@@ -856,7 +877,6 @@ ui <- fluidPage(
       passwordInput("admin_password", "Admin password"),
       actionButton("unlock_admin", "Unlock scorekeeping", class = "btn-warning"),
       uiOutput("admin_status"),
-      uiOutput("manual_game_ui"),
       hr(),
       h4("Google Sheet"),
       textInput(
@@ -884,6 +904,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       h4("Schedule, Courts, Byes, & Scoring"),
+      uiOutput("manual_game_ui"),
       uiOutput("games_ui"),
       hr(),
       h4("Player Results"),
@@ -900,7 +921,7 @@ server <- function(input, output, session) {
   schedule_version <- reactiveVal(0)
   admin_unlocked <- reactiveVal(FALSE)
   finals_schedule_value <- reactiveVal(NULL)
-  manual_games <- reactiveVal(tibble())
+  manual_games <- reactiveVal(empty_manual_games())
 
   observe({
     controls <- c("push_sheets")
@@ -946,7 +967,7 @@ server <- function(input, output, session) {
   observeEvent(input$make_schedule, {
     schedule_version(schedule_version() + 1)
     finals_schedule_value(NULL)
-    manual_games(tibble())
+    manual_games(empty_manual_games())
   }, ignoreInit = TRUE, priority = 100)
   
   prelim_schedule <- eventReactive(input$make_schedule, {
