@@ -360,6 +360,43 @@ games_complete <- function(scores_tbl) {
   nrow(scores_tbl) > 0 && all(!is.na(scores_tbl$scoreA) & !is.na(scores_tbl$scoreB))
 }
 
+played_scores <- function(scores_tbl) {
+  scores_tbl %>%
+    filter(!is.na(scoreA), !is.na(scoreB), !(scoreA == 0 & scoreB == 0))
+}
+
+played_games <- function(schedule_games, scores_tbl) {
+  schedule_games %>%
+    semi_join(played_scores(scores_tbl), by = "game_id")
+}
+
+canonical_team <- function(team) {
+  str_split(team, " / ") %>%
+    purrr::map_chr(~ paste(sort(str_trim(.x)), collapse = " / "))
+}
+
+canonical_matchup <- function(team_a, team_b) {
+  team_a <- canonical_team(team_a)
+  team_b <- canonical_team(team_b)
+  purrr::map2_chr(team_a, team_b, ~ paste(sort(c(.x, .y)), collapse = " vs "))
+}
+
+empty_contested_matchups <- function() {
+  tibble(
+    `League Date` = as.Date(character()),
+    matchup_key = character()
+  )
+}
+
+contested_matchups_from_games <- function(schedule_games, league_date) {
+  schedule_games %>%
+    transmute(
+      `League Date` = as.Date(league_date),
+      matchup_key = canonical_matchup(teamA, teamB)
+    ) %>%
+    distinct()
+}
+
 players_in_games <- function(games, preferred_order = character()) {
   game_players <- unique(unlist(str_split(c(games$teamA, games$teamB), " / ")))
   game_players <- game_players[nzchar(game_players)]
@@ -701,10 +738,24 @@ google_sheet_url <- function(url_or_id) {
 }
 
 season_raw_columns <- c("League Date", "Player", "Win", "Losses", "Games", "W-L %", "PD")
+daily_raw_columns <- c("League Date", "Set ID", "Player", "Win", "Losses", "Games", "W-L %", "PD")
 
 empty_season_raw_results <- function() {
   tibble(
     `League Date` = as.Date(character()),
+    Player = character(),
+    Win = integer(),
+    Losses = integer(),
+    Games = integer(),
+    `W-L %` = numeric(),
+    PD = numeric()
+  )
+}
+
+empty_daily_raw_results <- function() {
+  tibble(
+    `League Date` = as.Date(character()),
+    `Set ID` = character(),
     Player = character(),
     Win = integer(),
     Losses = integer(),
@@ -725,6 +776,78 @@ daily_results_for_season <- function(results_tbl, league_date) {
       `W-L %` = `Win %`,
       PD = Total
     )
+}
+
+daily_set_results <- function(results_tbl, league_date, set_id) {
+  daily_results_for_season(results_tbl, league_date) %>%
+    mutate(`Set ID` = set_id, .after = `League Date`)
+}
+
+read_daily_raw_results <- function(sheet_id, sheet_name = "Daily Raw Results") {
+  existing <- tryCatch(
+    read_sheet(ss = sheet_id, sheet = sheet_name, col_types = "c"),
+    error = function(e) empty_daily_raw_results()
+  )
+
+  if (nrow(existing) == 0) return(empty_daily_raw_results())
+
+  for (col in setdiff(daily_raw_columns, names(existing))) {
+    existing[[col]] <- NA
+  }
+
+  existing %>%
+    select(any_of(daily_raw_columns)) %>%
+    mutate(
+      `League Date` = as.Date(`League Date`),
+      `Set ID` = as.character(`Set ID`),
+      Win = as.integer(Win),
+      Losses = as.integer(Losses),
+      Games = as.integer(Games),
+      `W-L %` = as.numeric(`W-L %`),
+      PD = as.numeric(PD)
+    )
+}
+
+update_daily_raw_results <- function(existing_raw, set_raw, league_date, set_id) {
+  bind_rows(
+    existing_raw %>%
+      filter(!(as.Date(`League Date`) == as.Date(league_date) & `Set ID` == set_id)),
+    set_raw
+  ) %>%
+    arrange(`League Date`, `Set ID`, Player)
+}
+
+compute_daily_results <- function(daily_raw, league_date) {
+  day_rows <- daily_raw %>%
+    filter(as.Date(`League Date`) == as.Date(league_date))
+
+  if (nrow(day_rows) == 0) {
+    return(tibble(
+      Rank = character(),
+      Player = character(),
+      Wins = integer(),
+      Losses = integer(),
+      `Win %` = numeric(),
+      Total = numeric()
+    ))
+  }
+
+  day_rows %>%
+    group_by(Player) %>%
+    summarise(
+      Wins = sum(Win, na.rm = TRUE),
+      Losses = sum(Losses, na.rm = TRUE),
+      Total = sum(PD, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(Player) %>%
+    mutate(
+      Seed = row_number(),
+      `Win %` = if_else(Wins + Losses > 0, Wins / (Wins + Losses), NA_real_)
+    ) %>%
+    select(Player, Seed, Wins, Losses, `Win %`, Total) %>%
+    add_final_ranking() %>%
+    select(-any_of("Seed"))
 }
 
 read_season_raw_results <- function(sheet_id, sheet_name = "Season Raw Results") {
@@ -1047,6 +1170,7 @@ ui <- fluidPage(
     mainPanel(
       h4("Schedule, Courts, Byes, & Scoring"),
       uiOutput("games_ui"),
+      uiOutput("unique_games_ui"),
       uiOutput("manual_game_ui"),
       hr(),
       h4("Player Results"),
@@ -1065,6 +1189,8 @@ server <- function(input, output, session) {
   finals_schedule_value <- reactiveVal(NULL)
   manual_games <- reactiveVal(empty_manual_games())
   manual_game_active <- reactiveVal(FALSE)
+  current_set_id <- reactiveVal(NULL)
+  contested_matchups <- reactiveVal(empty_contested_matchups())
 
   observe({
     controls <- c("push_sheets", "finalize_day")
@@ -1152,6 +1278,7 @@ server <- function(input, output, session) {
     finals_schedule_value(NULL)
     manual_games(empty_manual_games())
     manual_game_active(FALSE)
+    current_set_id(format(Sys.time(), "%Y%m%d%H%M%S"))
   }, ignoreInit = TRUE, priority = 100)
   
   prelim_schedule <- eventReactive(input$make_schedule, {
@@ -1434,6 +1561,39 @@ server <- function(input, output, session) {
     }
     do.call(tagList, elems)
   })
+
+  output$unique_games_ui <- renderUI({
+    req(schedule())
+    prior <- contested_matchups() %>%
+      filter(as.Date(`League Date`) == as.Date(input$league_date %||% Sys.Date()))
+
+    if (nrow(prior) == 0) return(NULL)
+
+    unique_games <- schedule()$games %>%
+      mutate(matchup_key = canonical_matchup(teamA, teamB)) %>%
+      filter(!(matchup_key %in% prior$matchup_key)) %>%
+      arrange(round, court, game_id)
+
+    tagList(
+      hr(),
+      h4("Unique Games Not Yet Contested Today"),
+      if (nrow(unique_games) == 0) {
+        tags$p(class = "text-muted", "Every game in this schedule has already been contested today.")
+      } else {
+        tags$ul(
+          purrr::map(seq_len(nrow(unique_games)), function(i) {
+            tags$li(sprintf(
+              "Round %d, Court %d: %s vs %s",
+              unique_games$round[i],
+              unique_games$court[i],
+              unique_games$teamA_display[i],
+              unique_games$teamB_display[i]
+            ))
+          })
+        )
+      }
+    )
+  })
   
   player_results <- reactive({
     req(schedule())
@@ -1585,10 +1745,33 @@ server <- function(input, output, session) {
         )
       }
 
-      tbl <- apply_shootout_resolutions(player_results(), shootout_groups, input)
+      export_scores <- played_scores(scores_tbl())
+      export_games <- played_games(schedule()$games, scores_tbl())
+      if (nrow(export_games) == 0) {
+        stop("Enter at least one real score before pushing results.", call. = FALSE)
+      }
+
+      tbl <- compute_player_results(
+        players_in_games(export_games, players_vec()),
+        export_games,
+        export_scores
+      )
+      tbl <- apply_shootout_resolutions(tbl, shootout_groups, input)
       req(nrow(tbl) > 0)
       ss_id <- extract_sheet_id(input$sheet_url)
-      tabs <- if (include_season) list() else list("DDC Results" = tbl)
+      league_date <- input$league_date %||% Sys.Date()
+      set_id <- current_set_id() %||% format(Sys.time(), "%Y%m%d%H%M%S")
+      gs_auth()
+
+      set_raw <- daily_set_results(tbl, league_date, set_id)
+      daily_raw <- update_daily_raw_results(
+        read_daily_raw_results(ss_id),
+        set_raw,
+        league_date,
+        set_id
+      )
+      daily_tbl <- compute_daily_results(daily_raw, league_date)
+      tabs <- if (include_season) list() else list("DDC Results" = daily_tbl)
 
       if (!include_season && (input$format_mode %||% "single") == "two_group") {
         prelim_groups <- prelim_shootout_groups()
@@ -1607,26 +1790,29 @@ server <- function(input, output, session) {
         tabs[["Prelim Results"]] <- prelim_tbl
       }
 
+      if (!include_season) {
+        tabs[["Daily Raw Results"]] <- daily_raw
+      }
+
       if (include_season) {
-        if (!games_complete(scores_tbl())) {
-          stop("Finish all scores before finalizing the day.", call. = FALSE)
-        }
         if ((input$format_mode %||% "single") == "two_group" && is.null(finals_schedule_value())) {
           stop("Generate finals before finalizing a two-group day.", call. = FALSE)
         }
-        league_date <- input$league_date %||% Sys.Date()
-        gs_auth()
-        daily_raw <- daily_results_for_season(tbl, league_date)
         season_raw <- update_season_raw_results(
           read_season_raw_results(ss_id),
-          daily_raw,
+          daily_results_for_season(daily_tbl, league_date),
           league_date
         )
+        tabs[["Daily Raw Results"]] <- daily_raw
         tabs[["Season Raw Results"]] <- season_raw
         tabs[["Season Standings"]] <- compute_season_standings(season_raw)
       }
 
-      list(sheet_id = ss_id, tabs = tabs)
+      list(
+        sheet_id = ss_id,
+        tabs = tabs,
+        played_matchups = contested_matchups_from_games(export_games, league_date)
+      )
   }
 
   push_tabs <- function(include_season = FALSE) {
@@ -1636,6 +1822,10 @@ server <- function(input, output, session) {
       built$tabs,
       built$sheet_id,
       format_sheets = format_sheets
+    )
+    contested_matchups(
+      bind_rows(contested_matchups(), built$played_matchups) %>%
+        distinct()
     )
     if (include_season) {
       paste0("Day finalized and season standings updated.\n", sheet_url)
