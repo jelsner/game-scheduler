@@ -1,5 +1,5 @@
 # app.R
-# DDC / Escape!! ranked pairings + scoring (4–11 players)
+# DDC / Escape!! ranked pairings + scoring (4–12 players)
 # Field-proofed: autosave to LocalStorage, autoreconnect, heartbeat keep-alive,
 # round-based per-player differentials, two-court rounds collapsed by round.
 
@@ -218,8 +218,44 @@ make_schedule <- function(players) {
       list(round=14, court=1, A=c(6,11), B=c(7,9)),
       list(round=14, court=2, A=c(1,4),  B=c(2,3))
     )
+  } else if (n == 12) {
+    specs <- list(
+      list(round=1,  court=2, A=c(2,6),   B=c(3,5)),
+      list(round=1,  court=3, A=c(9,11),  B=c(8,12)),
+      list(round=2,  court=1, A=c(1,2),   B=c(5,10)),
+      list(round=2,  court=2, A=c(3,12),  B=c(7,8)),
+      list(round=2,  court=3, A=c(6,9),   B=c(4,11)),
+      list(round=3,  court=1, A=c(1,6),   B=c(2,5)),
+      list(round=3,  court=2, A=c(3,4),   B=c(8,11)),
+      list(round=3,  court=3, A=c(7,12),  B=c(9,10)),
+      list(round=4,  court=1, A=c(1,11),  B=c(4,8)),
+      list(round=4,  court=2, A=c(2,10),  B=c(6,12)),
+      list(round=4,  court=3, A=c(3,9),   B=c(5,7)),
+      list(round=5,  court=1, A=c(1,9),   B=c(4,6)),
+      list(round=5,  court=2, A=c(2,8),   B=c(3,7)),
+      list(round=5,  court=3, A=c(5,11),  B=c(10,12)),
+      list(round=6,  court=1, A=c(1,7),   B=c(3,11)),
+      list(round=6,  court=2, A=c(2,12),  B=c(5,9)),
+      list(round=6,  court=3, A=c(4,10),  B=c(6,8)),
+      list(round=7,  court=2, A=c(1,3),   B=c(7,9)),
+      list(round=7,  court=3, A=c(4,12),  B=c(6,10)),
+      list(round=8,  court=1, A=c(1,10),  B=c(3,8)),
+      list(round=8,  court=2, A=c(11,12), B=c(5,6)),
+      list(round=8,  court=3, A=c(2,9),   B=c(4,7)),
+      list(round=9,  court=1, A=c(1,12),  B=c(6,7)),
+      list(round=9,  court=2, A=c(2,11),  B=c(3,10)),
+      list(round=9,  court=3, A=c(5,8),   B=c(4,9)),
+      list(round=10, court=1, A=c(1,8),   B=c(2,7)),
+      list(round=10, court=2, A=c(4,5),   B=c(3,6)),
+      list(round=10, court=3, A=c(9,12),  B=c(10,11)),
+      list(round=11, court=1, A=c(1,4),   B=c(2,3)),
+      list(round=11, court=2, A=c(5,12),  B=c(8,9)),
+      list(round=11, court=3, A=c(7,10),  B=c(6,11)),
+      list(round=12, court=2, A=c(1,5),   B=c(2,4)),
+      list(round=12, court=3, A=c(7,11),  B=c(8,10))
+    )
   } else {
-    shiny::validate(shiny::need(FALSE, "This app currently supports ranked schedules for 4-11 players."))
+    shiny::validate(shiny::need(FALSE, "This app currently supports ranked schedules for 4-12 players."))
   }
   
   games <- mk_games_df(p, specs)
@@ -314,8 +350,58 @@ snake_groups <- function(players) {
   groups
 }
 
+snake_groups_n <- function(players, group_count) {
+  n <- length(players)
+  base_size <- n %/% group_count
+  extras <- n %% group_count
+  group_sizes <- rep(base_size, group_count)
+  if (extras > 0) group_sizes[seq_len(extras)] <- group_sizes[seq_len(extras)] + 1L
+
+  groups <- rep(list(character()), group_count)
+  for (seed in seq_along(players)) {
+    row <- ceiling(seed / group_count)
+    row_order <- if (row %% 2 == 1) seq_len(group_count) else rev(seq_len(group_count))
+    target_group <- row_order[((seed - 1L) %% group_count) + 1L]
+
+    if (length(groups[[target_group]]) >= group_sizes[target_group]) {
+      open_groups <- which(lengths(groups) < group_sizes)
+      target_group <- open_groups[1]
+    }
+
+    groups[[target_group]] <- c(groups[[target_group]], players[seed])
+  }
+
+  names(groups) <- paste("Group", LETTERS[seq_len(group_count)])
+  groups
+}
+
 make_two_group_prelim_schedule <- function(players) {
   groups <- snake_groups(players)
+  parts <- list()
+  game_offset <- 0
+
+  for (idx in seq_along(groups)) {
+    sch <- make_schedule(groups[[idx]])
+    part <- add_schedule_context(
+      sch,
+      phase = "Preliminary",
+      group = names(groups)[idx],
+      game_offset = game_offset,
+      court_offset = idx - 1
+    )
+    parts[[idx]] <- part
+    game_offset <- max(part$games$game_id)
+  }
+
+  list(
+    games = bind_rows(purrr::map(parts, "games")) %>% arrange(phase, round, court, game_id),
+    byes = bind_byes(purrr::map(parts, "byes")),
+    groups = groups
+  )
+}
+
+make_three_group_prelim_schedule <- function(players) {
+  groups <- snake_groups_n(players, 3)
   parts <- list()
   game_offset <- 0
 
@@ -407,6 +493,17 @@ ranked_players_for_group <- function(players, games, scores_tbl) {
   compute_player_results(players, games, scores_tbl) %>% pull(Player)
 }
 
+compute_group_prelim_results <- function(prelim_schedule, prelim_scores) {
+  group_names <- names(prelim_schedule$groups)
+  bind_rows(purrr::map(group_names, function(group_name) {
+    group_games <- prelim_schedule$games %>% filter(group == group_name)
+    group_scores <- prelim_scores %>% semi_join(group_games, by = "game_id")
+    compute_player_results(prelim_schedule$groups[[group_name]], group_games, group_scores) %>%
+      mutate(Group = group_name) %>%
+      select(Group, dplyr::everything())
+  }))
+}
+
 make_two_group_finals_schedule <- function(prelim_schedule, prelim_scores, prelim_results = NULL) {
   if (!games_complete(prelim_scores)) return(NULL)
 
@@ -454,6 +551,48 @@ make_two_group_finals_schedule <- function(prelim_schedule, prelim_scores, preli
     byes = bind_byes(championship$byes, consolation$byes),
     championship_players = championship_players,
     consolation_players = consolation_players
+  )
+}
+
+make_three_group_finals_schedule <- function(prelim_schedule, prelim_scores, prelim_results = NULL) {
+  if (!games_complete(prelim_scores)) return(NULL)
+
+  if (is.null(prelim_results)) {
+    prelim_results <- compute_group_prelim_results(prelim_schedule, prelim_scores)
+  }
+
+  ranked <- prelim_results %>%
+    mutate(.rank_num = suppressWarnings(as.integer(Rank))) %>%
+    filter(!is.na(.rank_num))
+
+  group_winners <- ranked %>%
+    filter(.rank_num == 1L) %>%
+    arrange(Group) %>%
+    pull(Player)
+
+  wildcard <- ranked %>%
+    filter(.rank_num > 1L) %>%
+    arrange(.rank_num, desc(`Win %`), desc(Total), Player) %>%
+    slice_head(n = 1) %>%
+    pull(Player)
+
+  championship_players <- c(group_winners, wildcard)
+  if (length(championship_players) != 4 || any(!nzchar(championship_players))) {
+    return(NULL)
+  }
+
+  championship <- add_schedule_context(
+    make_schedule(championship_players),
+    phase = "Finals",
+    group = "Championship Final",
+    game_offset = max(prelim_schedule$games$game_id),
+    court_offset = 0
+  )
+
+  list(
+    games = championship$games %>% arrange(phase, round, court, game_id),
+    byes = championship$byes,
+    championship_players = championship_players
   )
 }
 
@@ -1104,7 +1243,7 @@ ui <- fluidPage(
       Shiny.setInputValue('saved_state', raw || null, {priority:'event'});
     });
   ")),
-  titlePanel("DDC / Escape!! - Ranked Pairings & Scores (4-11 players)"),
+  titlePanel("DDC / Escape!! - Ranked Pairings & Scores (4-12 players)"),
   tags$p(
     class = "text-muted",
     "Ranked Pairings are based on the Kodiak system developed by Cade Loving."
@@ -1122,7 +1261,8 @@ ui <- fluidPage(
         "Format",
         choices = c(
           "Single MoC" = "single",
-          "Two groups + finals" = "two_group"
+          "Two groups + finals" = "two_group",
+          "Groups + Final (3 groups)" = "three_group"
         ),
         selected = "single"
       ),
@@ -1268,8 +1408,8 @@ server <- function(input, output, session) {
     req(input$players_raw)
     x <- str_split(input$players_raw, "\\r?\\n")[[1]] |> str_trim()
     x <- x[nzchar(x)]
-    shiny::validate(shiny::need(length(x) >= 4, "Please enter at least 4 players (up to 11 supported)."))
-    shiny::validate(shiny::need(length(x) <= 11, "Please limit to 11 players for this version."))
+    shiny::validate(shiny::need(length(x) >= 4, "Please enter at least 4 players (up to 12 supported)."))
+    shiny::validate(shiny::need(length(x) <= 12, "Please limit to 12 players for this version."))
     x
   })
 
@@ -1288,6 +1428,9 @@ server <- function(input, output, session) {
     if (mode == "two_group") {
       shiny::validate(shiny::need(length(players) >= 8, "Two-group format requires at least 8 players."))
       make_two_group_prelim_schedule(players)
+    } else if (mode == "three_group") {
+      shiny::validate(shiny::need(length(players) == 12, "Three groups + final requires exactly 12 players."))
+      make_three_group_prelim_schedule(players)
     } else {
       add_schedule_context(make_schedule(players), phase = "Main", group = "All")
     }
@@ -1300,8 +1443,8 @@ server <- function(input, output, session) {
 
   preliminary_results <- reactive({
     req(prelim_schedule())
-    if ((input$format_mode %||% "single") != "two_group") return(NULL)
-    compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), NULL, prelim_scores_tbl())
+    if (!((input$format_mode %||% "single") %in% c("two_group", "three_group"))) return(NULL)
+    compute_group_prelim_results(prelim_schedule(), prelim_scores_tbl())
   })
 
   prelim_shootout_groups <- reactive({
@@ -1346,7 +1489,7 @@ server <- function(input, output, session) {
   })
 
   output$finals_controls <- renderUI({
-    if (!admin_unlocked() || (input$format_mode %||% "single") != "two_group") return(NULL)
+    if (!admin_unlocked() || !((input$format_mode %||% "single") %in% c("two_group", "three_group"))) return(NULL)
     if (is.null(prelim_schedule())) return(NULL)
     if (!games_complete(prelim_scores_tbl())) {
       return(tags$p(class = "text-muted", "Finish preliminary scores before generating finals."))
@@ -1366,16 +1509,25 @@ server <- function(input, output, session) {
 
   observeEvent(input$generate_finals, {
     req(admin_unlocked())
-    req((input$format_mode %||% "single") == "two_group")
+    req((input$format_mode %||% "single") %in% c("two_group", "three_group"))
     req(games_complete(prelim_scores_tbl()))
     req(length(unresolved_shootout_labels(prelim_shootout_groups(), input)) == 0)
-    finals_schedule_value(
-      make_two_group_finals_schedule(
+    mode <- input$format_mode %||% "single"
+    if (mode == "three_group") {
+      finals_schedule_value(
+        make_three_group_finals_schedule(
+          prelim_schedule(),
+          prelim_scores_tbl(),
+          resolved_preliminary_results()
+        )
+      )
+    } else {
+      finals_schedule_value(make_two_group_finals_schedule(
         prelim_schedule(),
         prelim_scores_tbl(),
         resolved_preliminary_results()
-      )
-    )
+      ))
+    }
   }, ignoreInit = TRUE)
 
   output$manual_game_button_ui <- renderUI({
@@ -1473,7 +1625,7 @@ server <- function(input, output, session) {
       updateTextAreaInput(session, "players_raw", value = dat$players_raw)
     }
 
-    if (!is.null(dat$format_mode) && dat$format_mode %in% c("single", "two_group")) {
+    if (!is.null(dat$format_mode) && dat$format_mode %in% c("single", "two_group", "three_group")) {
       updateRadioButtons(session, "format_mode", selected = dat$format_mode)
     }
     
@@ -1600,6 +1752,9 @@ server <- function(input, output, session) {
     if ((input$format_mode %||% "single") == "two_group") {
       return(compute_two_group_results(prelim_schedule(), prelim_scores_tbl(), finals_schedule_value(), scores_tbl()))
     }
+    if ((input$format_mode %||% "single") == "three_group" && is.null(finals_schedule_value())) {
+      return(preliminary_results())
+    }
     counted_games <- schedule()$games %>% filter(count_in_standings)
     counted_scores <- scores_tbl() %>% semi_join(counted_games, by = "game_id")
     compute_player_results(players_in_games(counted_games, players_vec()), counted_games, counted_scores)
@@ -1607,7 +1762,7 @@ server <- function(input, output, session) {
 
   current_shootout_groups <- reactive({
     req(player_results())
-    if ((input$format_mode %||% "single") == "two_group") {
+    if ((input$format_mode %||% "single") %in% c("two_group", "three_group")) {
       prelim_groups <- prelim_shootout_groups()
       if (length(unresolved_shootout_labels(prelim_groups, input)) > 0) return(prelim_groups)
 
@@ -1795,8 +1950,8 @@ server <- function(input, output, session) {
       }
 
       if (include_season) {
-        if ((input$format_mode %||% "single") == "two_group" && is.null(finals_schedule_value())) {
-          stop("Generate finals before finalizing a two-group day.", call. = FALSE)
+        if ((input$format_mode %||% "single") %in% c("two_group", "three_group") && is.null(finals_schedule_value())) {
+          stop("Generate finals before finalizing a grouped day.", call. = FALSE)
         }
         season_raw <- update_season_raw_results(
           read_season_raw_results(ss_id),
@@ -1817,7 +1972,7 @@ server <- function(input, output, session) {
 
   push_tabs <- function(include_season = FALSE) {
     built <- build_result_tabs(include_season = include_season)
-    format_sheets <- if (include_season) character(0) else "DDC Results"
+    format_sheets <- character(0)
     sheet_url <- push_result_tabs_to_sheet(
       built$tabs,
       built$sheet_id,
