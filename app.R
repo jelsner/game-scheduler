@@ -1103,7 +1103,7 @@ compute_season_standings <- function(season_raw) {
       `Avg Rank` = (`Rank 1` + `Rank 2`) / 2
     ) %>%
     select(Player, Win, Losses, Games, `W-L %`, `Rank 1`, PD, `PD/Game`, `Rank 2`, `Avg Rank`) %>%
-    arrange(`Avg Rank`, `Rank 1`, `Rank 2`, desc(`W-L %`), desc(`PD/Game`), Player)
+    arrange(`Avg Rank`, desc(`W-L %`), `Rank 1`, `Rank 2`, desc(`PD/Game`), Player)
 }
 
 read_players_from_season_standings <- function(sheet_id, sheet_name = "Season Standings") {
@@ -1295,7 +1295,7 @@ ui <- fluidPage(
   titlePanel("DDC / Escape!! - Ranked Pairings & Scores (4-19 players)"),
   tags$p(
     class = "text-muted",
-    "Ranked Pairings are based on the Kodiak system developed by Cade Loving."
+    "MoC Ranked Pairings are based on the Kodiak system developed by Cade Loving."
   ),
   
   sidebarLayout(
