@@ -927,6 +927,11 @@ group_final_type <- function(players) {
 
 season_raw_columns <- c("League Date", "Player", "Win", "Losses", "Games", "W-L %", "PD")
 daily_raw_columns <- c("League Date", "Set ID", "Player", "Win", "Losses", "Games", "W-L %", "PD")
+game_raw_columns <- c(
+  "League Date", "Set ID", "Game ID", "Phase", "Group", "Round", "Court",
+  "Team A Player 1", "Team A Player 2", "Team B Player 1", "Team B Player 2",
+  "Team A Score", "Team B Score", "Counts in Standings"
+)
 
 empty_season_raw_results <- function() {
   tibble(
@@ -951,6 +956,176 @@ empty_daily_raw_results <- function() {
     `W-L %` = numeric(),
     PD = numeric()
   )
+}
+
+empty_game_raw_results <- function() {
+  tibble(
+    `League Date` = as.Date(character()),
+    `Set ID` = character(),
+    `Game ID` = integer(),
+    Phase = character(),
+    Group = character(),
+    Round = integer(),
+    Court = integer(),
+    `Team A Player 1` = character(),
+    `Team A Player 2` = character(),
+    `Team B Player 1` = character(),
+    `Team B Player 2` = character(),
+    `Team A Score` = numeric(),
+    `Team B Score` = numeric(),
+    `Counts in Standings` = logical()
+  )
+}
+
+game_results_for_history <- function(schedule_games, scores_tbl, league_date, set_id) {
+  team_player <- function(team, position) {
+    purrr::map_chr(str_split(team, " / ", n = 2), ~ .x[position] %||% NA_character_)
+  }
+
+  schedule_games %>%
+    inner_join(played_scores(scores_tbl), by = "game_id") %>%
+    transmute(
+      `League Date` = as.Date(league_date),
+      `Set ID` = as.character(set_id),
+      `Game ID` = as.integer(game_id),
+      Phase = as.character(phase),
+      Group = as.character(group),
+      Round = as.integer(round),
+      Court = as.integer(court),
+      `Team A Player 1` = team_player(teamA, 1),
+      `Team A Player 2` = team_player(teamA, 2),
+      `Team B Player 1` = team_player(teamB, 1),
+      `Team B Player 2` = team_player(teamB, 2),
+      `Team A Score` = as.numeric(scoreA),
+      `Team B Score` = as.numeric(scoreB),
+      `Counts in Standings` = as.logical(count_in_standings)
+    )
+}
+
+read_game_raw_results <- function(sheet_id, sheet_name = "Game Raw Results") {
+  if (!(sheet_name %in% sheet_names(sheet_id))) return(empty_game_raw_results())
+
+  existing <- read_sheet(ss = sheet_id, sheet = sheet_name, col_types = "c")
+
+  if (nrow(existing) == 0) return(empty_game_raw_results())
+
+  for (col in setdiff(game_raw_columns, names(existing))) {
+    existing[[col]] <- NA
+  }
+
+  existing %>%
+    select(any_of(game_raw_columns)) %>%
+    mutate(
+      `League Date` = as.Date(`League Date`),
+      `Set ID` = as.character(`Set ID`),
+      `Game ID` = as.integer(`Game ID`),
+      Round = as.integer(Round),
+      Court = as.integer(Court),
+      `Team A Score` = as.numeric(`Team A Score`),
+      `Team B Score` = as.numeric(`Team B Score`),
+      `Counts in Standings` = toupper(as.character(`Counts in Standings`)) == "TRUE"
+    )
+}
+
+update_game_raw_results <- function(existing_raw, set_raw, league_date, set_id) {
+  bind_rows(
+    existing_raw %>%
+      filter(!(as.Date(`League Date`) == as.Date(league_date) & `Set ID` == set_id)),
+    set_raw
+  ) %>%
+    arrange(`League Date`, `Set ID`, Round, Court, `Game ID`)
+}
+
+compute_elo_ratings <- function(game_raw, initial_rating = 1500, k_factor = 32) {
+  player_columns <- c(
+    "Team A Player 1", "Team A Player 2", "Team B Player 1", "Team B Player 2"
+  )
+  rated_games <- game_raw %>%
+    filter(
+      `Counts in Standings`,
+      !is.na(`Team A Score`),
+      !is.na(`Team B Score`),
+      if_all(all_of(player_columns), ~ !is.na(.x) & nzchar(.x))
+    ) %>%
+    arrange(`League Date`, `Set ID`, Round, Court, `Game ID`)
+
+  if (nrow(rated_games) == 0) {
+    return(tibble(
+      Rank = integer(),
+      Player = character(),
+      Elo = numeric(),
+      Games = integer(),
+      Wins = integer(),
+      Losses = integer(),
+      Ties = integer(),
+      `Strength of Schedule` = numeric()
+    ))
+  }
+
+  players <- unique(unlist(rated_games[player_columns], use.names = FALSE))
+  players <- players[!is.na(players) & nzchar(players)]
+  ratings <- stats::setNames(rep(initial_rating, length(players)), players)
+  games <- stats::setNames(integer(length(players)), players)
+  wins <- stats::setNames(integer(length(players)), players)
+  losses <- stats::setNames(integer(length(players)), players)
+  ties <- stats::setNames(integer(length(players)), players)
+
+  for (game_idx in seq_len(nrow(rated_games))) {
+    game <- rated_games[game_idx, ]
+    team_a <- c(game$`Team A Player 1`, game$`Team A Player 2`)
+    team_b <- c(game$`Team B Player 1`, game$`Team B Player 2`)
+    # A doubles team's Elo is the mean of its two player ratings. Both players
+    # receive the full team adjustment, keeping the four-player pool zero-sum.
+    team_a_rating <- mean(ratings[team_a])
+    team_b_rating <- mean(ratings[team_b])
+    expected_a <- 1 / (1 + 10 ^ ((team_b_rating - team_a_rating) / 400))
+    actual_a <- if (game$`Team A Score` > game$`Team B Score`) {
+      1
+    } else if (game$`Team A Score` < game$`Team B Score`) {
+      0
+    } else {
+      0.5
+    }
+    rating_change <- k_factor * (actual_a - expected_a)
+
+    ratings[team_a] <- ratings[team_a] + rating_change
+    ratings[team_b] <- ratings[team_b] - rating_change
+    games[c(team_a, team_b)] <- games[c(team_a, team_b)] + 1L
+
+    if (actual_a == 1) {
+      wins[team_a] <- wins[team_a] + 1L
+      losses[team_b] <- losses[team_b] + 1L
+    } else if (actual_a == 0) {
+      wins[team_b] <- wins[team_b] + 1L
+      losses[team_a] <- losses[team_a] + 1L
+    } else {
+      ties[c(team_a, team_b)] <- ties[c(team_a, team_b)] + 1L
+    }
+  }
+
+  # SOS is the average final Elo of the opposing team in each rated game.
+  sos_total <- stats::setNames(numeric(length(players)), players)
+  sos_games <- stats::setNames(integer(length(players)), players)
+  for (game_idx in seq_len(nrow(rated_games))) {
+    game <- rated_games[game_idx, ]
+    team_a <- c(game$`Team A Player 1`, game$`Team A Player 2`)
+    team_b <- c(game$`Team B Player 1`, game$`Team B Player 2`)
+    sos_total[team_a] <- sos_total[team_a] + mean(ratings[team_b])
+    sos_total[team_b] <- sos_total[team_b] + mean(ratings[team_a])
+    sos_games[c(team_a, team_b)] <- sos_games[c(team_a, team_b)] + 1L
+  }
+
+  tibble(
+    Player = players,
+    Elo = round(unname(ratings[players]), 1),
+    Games = unname(games[players]),
+    Wins = unname(wins[players]),
+    Losses = unname(losses[players]),
+    Ties = unname(ties[players]),
+    `Strength of Schedule` = round(unname(sos_total[players] / sos_games[players]), 1)
+  ) %>%
+    arrange(desc(Elo), desc(`Strength of Schedule`), Player) %>%
+    mutate(Rank = min_rank(desc(Elo)), .before = Player)
 }
 
 daily_results_for_season <- function(results_tbl, league_date) {
@@ -1351,7 +1526,8 @@ ui <- fluidPage(
       helpText(
         "Leave the URL blank to use the default sheet. ",
         "Live results are written to ", tags$strong("DDC Results"), ". Finalized results also update ",
-        tags$strong("Season Raw Results"), " and ", tags$strong("Season Standings"), "."
+        tags$strong("Game Raw Results"), ", ", tags$strong("Player Ratings"), ", ",
+        tags$strong("Season Raw Results"), ", and ", tags$strong("Season Standings"), "."
       ),
       verbatimTextOutput("sheet_push_status")
     ),
@@ -2014,12 +2190,26 @@ server <- function(input, output, session) {
         if (format_mode_value(input$format_mode) == "group_final" && is.null(finals_schedule_value())) {
           stop("Generate finals before finalizing a grouped day.", call. = FALSE)
         }
+        game_set_raw <- game_results_for_history(
+          export_games,
+          export_scores,
+          league_date,
+          set_id
+        )
+        game_raw <- update_game_raw_results(
+          read_game_raw_results(ss_id),
+          game_set_raw,
+          league_date,
+          set_id
+        )
         season_raw <- update_season_raw_results(
           read_season_raw_results(ss_id),
           daily_results_for_season(daily_tbl, league_date),
           league_date
         )
         tabs[["Daily Raw Results"]] <- daily_raw
+        tabs[["Game Raw Results"]] <- game_raw
+        tabs[["Player Ratings"]] <- compute_elo_ratings(game_raw)
         tabs[["Season Raw Results"]] <- season_raw
         tabs[["Season Standings"]] <- compute_season_standings(season_raw)
       }
@@ -2044,7 +2234,7 @@ server <- function(input, output, session) {
         distinct()
     )
     if (include_season) {
-      paste0("Day finalized and season standings updated.\n", sheet_url)
+      paste0("Day finalized; game history, player ratings, and season standings updated.\n", sheet_url)
     } else {
       paste0("Results pushed successfully.\n", sheet_url)
     }
@@ -2077,7 +2267,7 @@ server <- function(input, output, session) {
     })
 
     if (result$ok) {
-      showNotification("Day finalized and season standings updated.", type = "message", duration = 5)
+      showNotification("Day finalized; game history, player ratings, and season standings updated.", type = "message", duration = 5)
     } else {
       showNotification(result$msg, type = "error", duration = 8)
     }
