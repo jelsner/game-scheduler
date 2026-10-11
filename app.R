@@ -1513,8 +1513,8 @@ ui <- fluidPage(
             tags$code(google_service_account_email()),
             " as Editor (you can uncheck \"Notify people\")."
           ),
-          tags$li("Click ", tags$strong("Push Results"), " during play to update the daily results."),
-          tags$li("Click ", tags$strong("Finalize Day"), " after the final scores are complete to update season standings.")
+          tags$li("Click ", tags$strong("Push Results"), " during play to update daily results and game history."),
+          tags$li("Click ", tags$strong("Finalize Day"), " after the final scores are complete to update player ratings and season standings.")
         )
       ),
       textInput(
@@ -1525,8 +1525,9 @@ ui <- fluidPage(
       ),
       helpText(
         "Leave the URL blank to use the default sheet. ",
-        "Live results are written to ", tags$strong("DDC Results"), ". Finalized results also update ",
-        tags$strong("Game Raw Results"), ", ", tags$strong("Player Ratings"), ", ",
+        "Each push updates ", tags$strong("DDC Results"), ", ", tags$strong("Daily Raw Results"),
+        ", and ", tags$strong("Game Raw Results"), ". Finalizing also updates ",
+        tags$strong("Player Ratings"), ", ",
         tags$strong("Season Raw Results"), ", and ", tags$strong("Season Standings"), "."
       ),
       verbatimTextOutput("sheet_push_status")
@@ -2163,6 +2164,18 @@ server <- function(input, output, session) {
         set_id
       )
       daily_tbl <- compute_daily_results(daily_raw, league_date)
+      game_set_raw <- game_results_for_history(
+        export_games,
+        export_scores,
+        league_date,
+        set_id
+      )
+      game_raw <- update_game_raw_results(
+        read_game_raw_results(ss_id),
+        game_set_raw,
+        league_date,
+        set_id
+      )
       tabs <- if (include_season) list() else list("DDC Results" = daily_tbl)
 
       if (!include_season && format_mode_value(input$format_mode) == "group_final" && group_final_type(players_vec()) == "two_group") {
@@ -2184,24 +2197,13 @@ server <- function(input, output, session) {
 
       if (!include_season) {
         tabs[["Daily Raw Results"]] <- daily_raw
+        tabs[["Game Raw Results"]] <- game_raw
       }
 
       if (include_season) {
         if (format_mode_value(input$format_mode) == "group_final" && is.null(finals_schedule_value())) {
           stop("Generate finals before finalizing a grouped day.", call. = FALSE)
         }
-        game_set_raw <- game_results_for_history(
-          export_games,
-          export_scores,
-          league_date,
-          set_id
-        )
-        game_raw <- update_game_raw_results(
-          read_game_raw_results(ss_id),
-          game_set_raw,
-          league_date,
-          set_id
-        )
         season_raw <- update_season_raw_results(
           read_season_raw_results(ss_id),
           daily_results_for_season(daily_tbl, league_date),
@@ -2236,7 +2238,7 @@ server <- function(input, output, session) {
     if (include_season) {
       paste0("Day finalized; game history, player ratings, and season standings updated.\n", sheet_url)
     } else {
-      paste0("Results pushed successfully.\n", sheet_url)
+      paste0("Results and game history pushed successfully.\n", sheet_url)
     }
   }
 
@@ -2250,7 +2252,7 @@ server <- function(input, output, session) {
     })
 
     if (result$ok) {
-      showNotification("Results pushed to Google Sheet.", type = "message", duration = 5)
+      showNotification("Results and game history pushed to Google Sheet.", type = "message", duration = 5)
     } else {
       showNotification(result$msg, type = "error", duration = 8)
     }
